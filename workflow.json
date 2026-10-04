@@ -1,0 +1,1982 @@
+{
+  "name": "Generic AI Appointment Lead Assistant — Template",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "id": "be508a81-de40-4c4f-9257-ec8e05749cfe",
+      "name": "Daily Follow-Up Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -224,
+        1360
+      ],
+      "notes": "Activer (toggle) pour relances auto toutes les 24h. Tester d'abord Execute sur Find Follow-Up Candidates."
+    },
+    {
+      "parameters": {
+        "jsCode": "const TOKEN = \"YOUR_AIRTABLE_PERSONAL_ACCESS_TOKEN\";\nconst BASE = \"YOUR_AIRTABLE_BASE_ID\";\nconst TABLE = \"YOUR_AIRTABLE_LEADS_TABLE_ID\";\n\n// META 24h messaging window (J+0): ONLY contact clients who sent a message in the last 24 hours.\n// Sending outside this window risks Meta account bans.\n// Also: no RDV yet, ACTIVE, has sender_id, <3 followups total,\n// and we have not already followed-up since their last inbound message.\nconst formula = \"AND(\" +\n  \"OR({appointment_id} = '', {appointment_id} = BLANK()), \" +\n  \"OR({status} = 'ACTIVE', {status} = BLANK()), \" +\n  \"NOT({status} = 'STOP'), \" +\n  \"{sender_id} != '', \" +\n  \"{last_message_at} != '', \" +\n  \"NOT({last_message_at} = BLANK()), \" +\n  \"DATETIME_DIFF(NOW(), {last_message_at}, 'hours') < 24, \" +\n  \"OR({followup_count} = BLANK(), {followup_count} < 3), \" +\n  \"OR({last_followup_at} = BLANK(), IS_BEFORE({last_followup_at}, {last_message_at}))\" +\n  \")\";\n\nconst out = [];\nlet offset = '';\ndo {\n  const qs = {\n    filterByFormula: formula,\n    pageSize: 100,\n  };\n  if (offset) qs.offset = offset;\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.airtable.com/v0/${BASE}/${TABLE}`,\n    qs,\n    headers: { Authorization: 'Bearer ' + TOKEN },\n    json: true,\n    timeout: 30000,\n  });\n  const records = (res && res.records) || [];\n  for (const r of records) {\n    const f = r.fields || {};\n    const lastMsg = String(f.last_message_at || '').trim();\n    // Defense in depth: re-check 24h window in JS (Airtable NOW() timezone edge cases)\n    if (lastMsg) {\n      const t = Date.parse(lastMsg);\n      if (!Number.isFinite(t) || (Date.now() - t) >= 24 * 60 * 60 * 1000) continue;\n    } else {\n      continue;\n    }\n    out.push({\n      json: {\n        id: r.id,\n        ...f,\n        sender_id: f.sender_id || '',\n        senderId: f.sender_id || '',\n        followup_count: Number(f.followup_count || 0) || 0,\n        channel: f.channel || '',\n        langue: f.langue || 'FR',\n        prenom: f.prenom || '',\n        prestation: f.prestation || '',\n        historique: f.historique || '',\n        status: f.status || 'ACTIVE',\n        appointment_id: f.appointment_id || '',\n        last_followup_at: f.last_followup_at || '',\n        last_message_at: lastMsg,\n        metaWindowOk: true,\n      },\n    });\n  }\n  offset = (res && res.offset) || '';\n} while (offset);\n\nreturn out;\n"
+      },
+      "id": "a1f37c67-7d33-4521-9a00-2c5cf542c134",
+      "name": "Find Follow-Up Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1360
+      ],
+      "notes": "Follow-Up FIND via PAT → YOUR_AIRTABLE_BASE_ID/YOUR_AIRTABLE_LEADS_TABLE_ID. Ne touche pas Airtable Upsert Lead du bot principal."
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nfunction normLang(raw) {\n  const x = String(raw || 'FR').trim();\n  if (/^en/i.test(x)) return 'EN';\n  if (/^ar/i.test(x)) return 'AR';\n  if (/darija/i.test(x)) return 'darija';\n  return 'FR';\n}\n\nconst out = [];\nfor (const item of items) {\n  const j = item.json || {};\n  const status = String(j.status || '').trim().toUpperCase();\n  if (status === 'STOP') continue;\n\n  const senderId = String(j.sender_id || j.senderId || '').trim();\n  if (!senderId) continue;\n\n\n  // Meta 24h window — never enqueue outside customer care window\n  const lastMsgAt = String(j.last_message_at || '').trim();\n  if (!lastMsgAt) continue;\n  const lastMsgMs = Date.parse(lastMsgAt);\n  if (!Number.isFinite(lastMsgMs) || (Date.now() - lastMsgMs) >= 24 * 60 * 60 * 1000) continue;\n  // Skip if already booked\n  if (String(j.appointment_id || '').trim()) continue;\n\n  const lang = normLang(j.langue);\n  const prenom = j.prenom || '';\n  const hist = String(j.historique || '').slice(-1500);\n  const prestation = j.prestation || '';\n  const channel = String(j.channel || '').toLowerCase();\n\n  const prompt =\n    'You are YOUR_ASSISTANT_NAME, the booking assistant for YOUR_BUSINESS_NAME.\\n' +\n    'Ecris un court message de suivi (2-3 phrases max, 1 emoji max) pour relancer une cliente qui a ecrit mais n\\'a PAS encore reserve.\\n' +\n    'LANGUE: ' + lang + ' uniquement.\\n' +\n    'Ton: professionnel, chaleureux, humain.\\n' +\n    'Rappelle poliment que tu restes dispo pour tarifs / creneaux / reservation.\\n' +\n    'Ne dis PAS que c\\'est reserve. Pas de lien cal.com obligatoire.\\n' +\n    'Prenom: ' + (prenom || '(inconnu)') + '\\n' +\n    'Prestation: ' + (prestation || '(inconnue)') + '\\n' +\n    'Historique recent:\\n' + (hist || '(vide)') + '\\n\\n' +\n    'Ecris UNIQUEMENT le message final a envoyer.';\n\n  out.push({\n    json: {\n      ...j,\n      senderId,\n      channel,\n      langue: lang,\n      groqPrompt: prompt,\n      followup_count: Number(j.followup_count || 0),\n      airtableId: j.id || j.recordId || '',\n    },\n  });\n}\n\nif (!out.length) {\n  // No candidates — stop branch quietly\n  return [];\n}\nreturn out;\n"
+      },
+      "id": "4418f7c5-43d8-4f43-97af-7f0844e03fc5",
+      "name": "Build Follow-Up Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "YOUR_API_KEY"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"claude-sonnet-4-6\", max_tokens: 220, system: (\"Reply ONLY in \" + ($json.langue || \"FR\") + \" (FR|EN|AR|darija). Never mix languages. You are YOUR_ASSISTANT_NAME, YOUR_BUSINESS_NAME studio YOUR_BUSINESS_CITY.\"), messages: [{ role: \"user\", content: $json.groqPrompt }], temperature: 0.3 }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "d3ced3fe-15a9-4767-b278-1085f8046caf",
+      "name": "Generate Follow-Up Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        1360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Anthropic API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const builds = $('Build Follow-Up Prompt').all();\nconst raws = $input.all();\n\nreturn raws.map((item, i) => {\n  const raw = item.json || {};\n  const ctx = (builds[i] && builds[i].json) || (builds[0] && builds[0].json) || {};\n  // Claude Messages API\n  let text = '';\n  if (Array.isArray(raw.content)) {\n    text = String((raw.content.find((c) => c && c.type === 'text') || {}).text || '').trim();\n  }\n  // OpenAI/OpenRouter fallback (legacy)\n  if (!text) text = String(raw.choices?.[0]?.message?.content || '').trim();\n  if (!text) {\n    const lang = String(ctx.langue || 'FR').toUpperCase();\n    text = lang === 'EN'\n      ? ('Hi' + (ctx.prenom ? (' ' + ctx.prenom) : '') + '! Just checking in — still happy to help you book a YOUR_BUSINESS_NAME session when you are ready.')\n      : ('Bonjour' + (ctx.prenom ? (' ' + ctx.prenom) : '') + ' ! Je me permets un petit message — je reste dispo pour vous aider a reserver votre seance YOUR_BUSINESS_NAME quand vous voulez.');\n  }\n  text = text.replace(/https?:\\/\\/cal\\.com\\/\\S+/gi, '').trim();\n  if (text.length > 450) text = text.slice(0, 447) + '...';\n  return {\n    json: {\n      ...ctx,\n      finalResponse: text,\n      llmRawOk: !!(Array.isArray(raw.content) && raw.content.length) || !!(raw.choices?.[0]?.message?.content),\n    },\n  };\n});\n"
+      },
+      "id": "c161c221-c61e-4edc-b976-711fc98f33bd",
+      "name": "Parse Follow-Up Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "or",
+          "conditions": [
+            {
+              "id": "29a583fa-62a4-4ae3-9419-6fe1eaf3b016",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "instagram",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f30438da-3a1a-4c2c-9f72-dd5270973f1a",
+      "name": "Is Instagram?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        896,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v25.0/YOUR_META_PAGE_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { messaging_type: \"UPDATE\", recipient: { id: $json.senderId }, message: { text: $json.finalResponse } } }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "89341ff9-79a3-49ce-8a3d-cec0667894ca",
+      "name": "Follow-Up IG DM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        1264
+      ],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Meta Instagram Page Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v25.0/YOUR_WHATSAPP_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { messaging_product: \"whatsapp\", to: $json.senderId, type: \"text\", text: { body: $json.finalResponse } } }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "6bc1903e-230e-4e45-a600-09aa8ad0b554",
+      "name": "Follow-Up WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        1456
+      ],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Meta WhatsApp Cloud Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const TOKEN = \"YOUR_AIRTABLE_PERSONAL_ACCESS_TOKEN\";\nconst BASE = \"YOUR_AIRTABLE_BASE_ID\";\nconst TABLE = \"YOUR_AIRTABLE_LEADS_TABLE_ID\";\n\nconst items = $input.all();\nconst out = [];\n\nfor (const item of items) {\n  const j = item.json || {};\n  const senderId = String(j.senderId || j.sender_id || '').trim();\n  if (!senderId) {\n    out.push({ json: { ...j, airtableFollowUpOk: false, airtableError: 'missing_sender_id' } });\n    continue;\n  }\n\n  const nextCount = (Number(j.followup_count || 0) || 0) + 1;\n  const nowIso = new Date().toISOString();\n\n  // Find record by sender_id\n  let recordId = String(j.id || j.airtableId || '').trim();\n  if (!recordId) {\n    const formula = `{sender_id} = '${senderId.replace(/'/g, \"\\\\'\")}'`;\n    const found = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `https://api.airtable.com/v0/${BASE}/${TABLE}`,\n      qs: { filterByFormula: formula, maxRecords: 1 },\n      headers: { Authorization: 'Bearer ' + TOKEN },\n      json: true,\n      timeout: 20000,\n    });\n    recordId = (((found || {}).records || [])[0] || {}).id || '';\n  }\n\n  if (!recordId) {\n    out.push({ json: { ...j, airtableFollowUpOk: false, airtableError: 'record_not_found' } });\n    continue;\n  }\n\n  try {\n    const patched = await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: `https://api.airtable.com/v0/${BASE}/${TABLE}/${recordId}`,\n      headers: {\n        Authorization: 'Bearer ' + TOKEN,\n        'Content-Type': 'application/json',\n      },\n      body: {\n        fields: {\n          followup_count: nextCount,\n          last_followup_at: nowIso,\n        },\n      },\n      json: true,\n      timeout: 20000,\n    });\n    out.push({\n      json: {\n        ...j,\n        id: recordId,\n        followup_count: nextCount,\n        last_followup_at: nowIso,\n        airtableFollowUpOk: true,\n        airtablePatchedId: (patched && patched.id) || recordId,\n      },\n    });\n  } catch (e) {\n    out.push({\n      json: {\n        ...j,\n        airtableFollowUpOk: false,\n        airtableError: String((e && e.message) || e).slice(0, 300),\n      },\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "id": "b31e914b-fc40-47ba-ac49-65a042ba6b8d",
+      "name": "Update Follow-Up Count",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        1360
+      ],
+      "notes": "Follow-Up UPDATE via PAT → YOUR_AIRTABLE_BASE_ID/YOUR_AIRTABLE_LEADS_TABLE_ID"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "EVENT_RECEIVED",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "01977c91-537b-4e56-a3a7-32ecbd7804c3",
+      "name": "WA Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/plain"
+              }
+            ]
+          }
+        }
+      },
+      "id": "e5004a04-4c9e-424c-8e08-ee01a2176f83",
+      "name": "WA Respond Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        224,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.query?.['hub.mode'] || '' }}",
+              "operation": "equals",
+              "value2": "subscribe"
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "c454605d-561f-41d7-93c7-96e55b0a3db5",
+      "name": "WA Is Meta Verification?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        0,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "multipleMethods": true,
+        "path": "YOUR_BUSINESS_NAME-whatsapp",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "053b2c19-5882-4649-8df0-c8470578bb90",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        416
+      ],
+      "webhookId": "d086b15c-6fe0-4133-8343-465afb47cb6f"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "EVENT_RECEIVED",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "552fb85f-8ac4-4e33-a42f-7cab2d52c076",
+      "name": "Respond Meta OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/plain"
+              }
+            ]
+          }
+        }
+      },
+      "id": "4675536e-7638-410a-98ed-16850528ed6f",
+      "name": "Respond Meta Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.query?.['hub.mode'] || '' }}",
+              "operation": "equals",
+              "value2": "subscribe"
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "bf099c3d-515a-4e12-83e3-3696fd3326c1",
+      "name": "Is Meta Verification?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "multipleMethods": true,
+        "path": "YOUR_BUSINESS_NAME-instagram",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "d9971608-02c2-4698-91cc-c30396e3b5e7",
+      "name": "Instagram Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        32
+      ],
+      "webhookId": "e3cfdfbe-e9a4-4dcc-bd17-d009f1451400"
+    },
+    {
+      "parameters": {
+        "jsCode": "// BUYER SETUP: replace this map with your own Cal.com event type slugs and durations.\nconst CAL_LINKS = {\n  service_1: 'https://cal.com/YOUR_CAL_USERNAME/YOUR_EVENT_TYPE_1',\n  service_2: 'https://cal.com/YOUR_CAL_USERNAME/YOUR_EVENT_TYPE_2',\n  consultation: 'https://cal.com/YOUR_CAL_USERNAME/YOUR_CONSULTATION_EVENT_TYPE',\n};\nconst CAL_PACK_MAP = {\n  service_1: {\n    standard: { slug: 'YOUR_EVENT_TYPE_1_STANDARD', link: CAL_LINKS.service_1, durationMin: 60 },\n    premium: { slug: 'YOUR_EVENT_TYPE_1_PREMIUM', link: CAL_LINKS.service_1, durationMin: 90 },\n  },\n  service_2: {\n    standard: { slug: 'YOUR_EVENT_TYPE_2_STANDARD', link: CAL_LINKS.service_2, durationMin: 60 },\n  },\n  consultation: {\n    default: { slug: 'YOUR_CONSULTATION_EVENT_TYPE', link: CAL_LINKS.consultation, durationMin: 30 },\n  },\n};\nconst CAL_SESSION_FALLBACK = {\n  service_1: { slug: 'YOUR_EVENT_TYPE_1_STANDARD', link: CAL_LINKS.service_1, durationMin: 60 },\n  service_2: { slug: 'YOUR_EVENT_TYPE_2_STANDARD', link: CAL_LINKS.service_2, durationMin: 60 },\n  consultation: { slug: 'YOUR_CONSULTATION_EVENT_TYPE', link: CAL_LINKS.consultation, durationMin: 30 },\n  unknown: { slug: 'YOUR_DEFAULT_EVENT_TYPE', link: 'https://cal.com/YOUR_CAL_USERNAME/YOUR_DEFAULT_EVENT_TYPE', durationMin: 60 },\n};\n\nfunction resolveCalPack(prestation, packName) {\n  const service = String(prestation || 'unknown').toLowerCase();\n  const pack = String(packName || '').toLowerCase().trim();\n  const packs = CAL_PACK_MAP[service] || {};\n  if (pack && packs[pack]) return { ...packs[pack], prestation: service, packName: pack, needsPack: false };\n  const fallback = CAL_SESSION_FALLBACK[service] || CAL_SESSION_FALLBACK.unknown;\n  const needsPack = Object.keys(packs).filter((key) => key !== 'default').length > 1 && !pack;\n  return { ...fallback, prestation: service, packName: pack, needsPack };\n}\n\nconst SESSION_DURATION_MIN = { service_1: 60, service_2: 60, consultation: 30, default: 60 };\n\nconst STYLE_GUIDE = {\n  FR: 'Voix de YOUR_ASSISTANT_NAME : chaleureux, simple, premium. 2-3 phrases MAX. Vouvoiement. 1 emoji max. Pas de pavé ni listes longues. Direct et humain.',\n  EN: 'YOUR_ASSISTANT_NAME voice: warm, simple, premium. 2-3 sentences MAX. One emoji max. No long paragraphs.',\n  AR: 'صوت سكينة: دافئ وبسيط وأنيق. جملتان أو ثلاث كحد أقصى. إيموجي واحد فقط.',\n  darija: 'YOUR_ASSISTANT_NAME b darija: دافي، بسيط، طبيعي. جملتين بزاف بزاف. إيموجي واحد.'\n};\n\nconst FEW_SHOT = {\n  FR: 'Bonjour ! Merci pour votre message. Le 20 juillet a 10h est disponible pour votre seance. Envoyez-moi votre prenom et email pour que je reserve.',\n  EN: 'Hi! Thanks for your message. July 20 at 10:00 is available for your session. Send me your first name and email and I will book it.',\n  AR: 'مرحبا! شكرا على رسالتك. الموعد متاح. أرسلي الاسم والإيميل لأحجز لك.',\n  darija: 'Marhba! Chokran. L creneau disponible. 3tini smiya w email bach nreservi.'\n};\n\nconst CATALOGUE_TEXT = 'BUYER SETUP: add your catalog in the Get_catalogue tool.';\nconst PRICING_INFO = {};\nconst EVENEMENT_INFO = 'BUYER SETUP: add your event policy.';\n\nconst input = $input.first().json;\nconst body = input.body ?? input;\n\nlet channel = 'unknown';\nlet senderId = '';\nlet igUserId = '';\nlet messageText = '';\nlet messageType = 'text';\nlet source = 'unknown';\nlet mediaId = '';\nlet mediaUrl = '';\nlet audioMimeType = 'audio/ogg';\n\nif (body.channel && body.messageText && !body.object) {\n  channel = body.channel;\n  senderId = String(body.senderId || 'test_user');\n  messageText = String(body.messageText).trim();\n  messageType = body.messageType || 'text';\n  source = 'test';\n} else if (body.object === 'instagram' || body.object === 'page') {\n  source = 'instagram';\n  channel = 'instagram';\n  const entry = body.entry?.[0] || {};\n  const changeVal = entry.changes?.[0]?.value;\n  let msg = entry.messaging?.[0] || changeVal?.messages?.[0] || null;\n  if (!msg && changeVal?.message) msg = changeVal;\n  if (!msg) return [];\n  if (msg.message?.is_echo) return [];\n  senderId = msg.sender?.id || msg.from?.id || msg.from || '';\n  // Some Instagram webhook events put the business page in sender and the client in recipient.\n  // If sender is the YOUR_BUSINESS_NAME IG business ID, use recipient as the real client IGSID.\n  const recipientId = msg.recipient?.id || changeVal?.recipient?.id || '';\n  if (String(senderId) === 'YOUR_INSTAGRAM_ACCOUNT_ID' && recipientId) senderId = String(recipientId);\n  // Keep numeric IGSID for Graph send; username resolved later for Airtable sender_id\n  igUserId = String(senderId || '');\n  // Some IG webhook payloads already include username\n  var hookUser = String(\n    msg.sender?.username ||\n    msg.from?.username ||\n    changeVal?.from?.username ||\n    changeVal?.contacts?.[0]?.profile?.username ||\n    ''\n  ).replace(/^@/, '').trim();\n  if (hookUser && !/^\\d+$/.test(hookUser)) {\n    senderId = hookUser; // provisional; Apply IG Username will confirm\n  }\n  const igAttachments = msg.message?.attachments || msg.attachments || changeVal?.attachments || [];\n  const igAudio = Array.isArray(igAttachments)\n    ? igAttachments.find(a => /audio|voice/i.test(String(a?.type || a?.mime_type || '')) || a?.payload?.url || a?.payload?.id)\n    : null;\n  if (msg.message?.text) messageText = msg.message.text.trim();\n  else if (msg.text?.body) messageText = msg.text.body.trim();\n  else if (igAudio || msg.audio || msg.voice) {\n    messageType = 'audio';\n    messageText = '[audio]';\n    const payload = igAudio?.payload || {};\n    mediaId = String(payload.id || payload.media_id || payload.attachment_id || igAudio?.id || msg.audio?.id || msg.voice?.id || '').trim();\n    mediaUrl = String(payload.url || igAudio?.url || msg.audio?.url || msg.voice?.url || '').trim();\n    audioMimeType = igAudio?.mime_type || msg.audio?.mime_type || msg.voice?.mime_type || 'audio/ogg';\n  } else return [];\n} else if (body.object === 'whatsapp_business_account') {\n  source = 'whatsapp_webhook';\n  channel = 'whatsapp';\n  const change = body.entry?.[0]?.changes?.[0];\n  const field = change?.field || '';\n  const value = change?.value;\n  if (!value) return [];\n  if (field === 'history' || field === 'smb_app_state_sync') return [];\n  if (value.statuses && !value.messages && !value.smb_message_echoes) return [];\n  if (value.smb_message_echoes?.[0]) {\n    const echo = value.smb_message_echoes[0];\n    const store = $getWorkflowStaticData('global');\n    if (!store.clients) store.clients = {};\n    const sid = echo.to || echo.from || '';\n    const text = echo.text?.body || (echo.type === 'audio' ? '[audio]' : '[media]');\n    const c = store.clients[sid] || {};\n    store.clients[sid] = {\n      ...c,\n      channel: 'whatsapp',\n      history: ((c.history ? c.history + ' | ' : '') + 'YOUR_ASSISTANT_NAME (app): ' + text).slice(-2000),\n      updatedAt: new Date().toISOString(),\n    };\n    return [];\n  }\n  if (!value.messages?.[0]) return [];\n  const msg = value.messages[0];\n  senderId = msg.from || '';\n  if (msg.type === 'text') messageText = (msg.text?.body || '').trim();\n  else if (msg.type === 'interactive') {\n    messageText = (msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || '').trim();\n  } else if (msg.type === 'image' && msg.image?.caption) {\n    messageText = msg.image.caption.trim();\n  } else if (msg.type === 'audio' || msg.type === 'voice' || msg.audio || msg.voice) {\n    messageType = 'audio';\n    messageText = '[audio]';\n    mediaId = String(msg.audio?.id || msg.voice?.id || msg.audio?.media_id || msg.voice?.media_id || '').trim();\n    mediaUrl = String(msg.audio?.url || msg.voice?.url || '').trim();\n    audioMimeType = msg.audio?.mime_type || msg.voice?.mime_type || 'audio/ogg';\n  } else return [];\n} else {\n  return [];\n}\n\nif (!senderId) return [];\nif (messageType !== 'audio' && !messageText) return [];\n\nconst lower = messageText.toLowerCase();\nconst botPatterns = ['sent from meta', 'message automatique', 'auto-reply', 'réponse automatique'];\nconst spamPatterns = ['click here', 'buy now', 'free offer', 'crypto', 'invest now'];\nif (botPatterns.some((p) => lower.includes(p))) return [];\nconst shared = { CAL_LINKS, CAL_PACK_MAP, CAL_SESSION_FALLBACK, STYLE_GUIDE, FEW_SHOT, PRICING_INFO, CATALOGUE_TEXT, EVENEMENT_INFO, SESSION_DURATION_MIN, timestamp: new Date().toISOString() };\nif (spamPatterns.some((p) => lower.includes(p))) {\n  return [{ json: { channel, senderId, igUserId: (typeof igUserId !== 'undefined' ? igUserId : (channel === 'instagram' ? String(senderId) : '')), messageText, messageType, mediaId, mediaUrl, url: mediaUrl, audioMimeType, source, intention: 'spam', filtered: true, ...shared } }];\n}\n\nreturn [{ json: { channel, senderId, igUserId: (typeof igUserId !== 'undefined' ? igUserId : (channel === 'instagram' ? String(senderId) : '')), instagramUsername: (typeof hookUser !== 'undefined' && hookUser && !/^\\d+$/.test(hookUser) ? hookUser : ''), messageText, messageType, mediaId, mediaUrl, url: mediaUrl, audioMimeType, source, filtered: false, ...shared } }];"
+      },
+      "id": "9893ab80-c74e-4c89-b2b1-34ca47c88d1e",
+      "name": "Normalize & Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "750997cc-22ad-473c-b2c0-25814ce9d0fa",
+              "leftValue": "={{ $json.filtered === true && $json.intention === 'spam' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "828c1e28-0ce4-4346-9d35-898628a81378",
+      "name": "Is Spam?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b570acfb-f105-40f2-9cb5-9faeb55fa9ee",
+              "leftValue": "={{ $json.messageType }}",
+              "rightValue": "audio",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "969dd9eb-5f9d-4e79-a3eb-e0de51bd8065",
+      "name": "Is Audio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1344,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const n = $('Normalize & Filter').first().json;\nconst WA_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\nconst PAGE_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\n// MUST match Send WhatsApp token — old Prepare token caused graph Authentication Error\nconst metaToken = (n.channel === 'instagram') ? PAGE_TOKEN : WA_TOKEN;\nreturn [{ json: {\n  ...n,\n  metaToken,\n  mediaId: String(n.mediaId || '').trim(),\n  _waToken: WA_TOKEN,\n  _pageToken: PAGE_TOKEN,\n} }];\n"
+      },
+      "id": "c0852ee5-5329-412b-9f2c-98ad764847a8",
+      "name": "Prepare Audio Meta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        272
+      ],
+      "notes": "WA media uses Send WhatsApp token (fixes Authentication Error)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prep = $('Prepare Audio Meta').first().json;\nconst ready = (() => { try { return $('Resolve Media URL').first().json; } catch (e) { return {}; } })();\nconst raw = $input.first().json || {};\nconst text = String(raw.text || raw.transcript || '').trim();\nconst base = { ...prep, ...ready };\nif (!text) {\n  return [{ json: {\n    ...base,\n    messageText: '',\n    messageType: 'text',\n    transcriptionFailed: true,\n    audioError: String((raw.error && (raw.error.message || JSON.stringify(raw.error))) || base.audioError || 'empty_transcript').slice(0, 500),\n  } }];\n}\nreturn [{ json: {\n  ...base,\n  text,\n  messageText: text,\n  messageType: 'text',\n  transcriptionFailed: false,\n  fromAudio: true,\n  audioError: '',\n} }];\n"
+      },
+      "id": "ac4826c8-310d-4d27-9dc7-91c7e2a56eee",
+      "name": "Audio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        352
+      ],
+      "notes": "Map Groq Whisper `text` → messageText (example-like)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "transcript-ok",
+              "leftValue": "={{ $json.transcriptionFailed !== true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "49a1de23-9c0c-446f-acf2-b2c7b5b5949d",
+      "name": "Transcription OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2912,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json || {};\nconst replies = {\n  FR: 'Bonjour 🎤 Pouvez-vous me l écrire en texte s il vous plaît ?',\n  EN: 'Hello 🎤 Could you please type your message in text?',\n  AR: 'مرحبا 🎤 هل يمكنك كتابة رسالتك من فضلك؟',\n  darija: 'Salam 🎤 wach tqderi tkteb liya message f texte?',\n};\nconst lang = j.langue || 'FR';\nconst reply = replies[lang] || replies.FR;\nconst err = String(j.audioError || '').trim();\n// Temporary debug suffix so we see WHY STT failed (remove later)\nconst debug = err ? (' [' + err.slice(0, 80) + ']') : '';\nreturn [{ json: {\n  ...j,\n  messageText: '[audio]',\n  messageType: 'text',\n  audioFallback: true,\n  finalResponse: reply + debug,\n  escalated: false,\n  escalade_requise: false,\n  intention: 'autre',\n} }];\n"
+      },
+      "id": "85965ca1-937d-4335-a4be-b4624820f401",
+      "name": "Audio Fallback Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ...$input.first().json } }];"
+      },
+      "id": "32550708-3654-4b0a-b3f2-19929887b6b1",
+      "name": "Merge Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $input.first().json;\nconst store = $getWorkflowStaticData('global');\nif (!store.clients) store.clients = {};\n// Instagram: memory keyed by stable igUserId; CRM senderId may be username\nconst memKey = p.igUserId || p.senderId;\nconst c = store.clients[memKey] || store.clients[p.senderId] || store.clients[p.igUserId] || {};\nif (p.instagramUsername && !c.instagramUsername) c.instagramUsername = p.instagramUsername;\n\nconst history = c.history || '';\nconst conversationContext = history\n  ? ('[Historique conversation]\\n' + history + '\\n[Nouveau message client]\\n' + p.messageText)\n  : String(p.messageText || '');\n\nconst analyzeSystem = 'Tu es un classifieur JSON pour le chatbot studio photo YOUR_BUSINESS_NAME. Reponds UNIQUEMENT avec un objet JSON valide, sans markdown ni texte autour.';\n\nconst analyzeUser =\n  'Analyse cette conversation cliente YOUR_BUSINESS_NAME (studio photo YOUR_BUSINESS_CITY).\\n' +\n  'Retourne un JSON avec les cles:\\n' +\n  '- intention: tarif | reservation | annulation | reschedule | evenement | reclamation | spam | autre\\n' +\n  '- langue: FR | EN | AR | darija\\n' +\n  '- sentiment: positif | neutre | negatif\\n' +\n  '- urgence: haute | normale\\n' +\n  '- prestation: grossesse | newborn | cake_smash | famille | inconnu\\n' +\n  '- prenom: string\\n' +\n  '- heure_demandee: number ou null\\n' +\n  '- jour_demande: string\\n' +\n  '- escalade_requise: boolean\\n\\n' +\n  'Regles langue: dernier message client. Anglais=EN, Francais=FR, arabe litteraire=AR, darija marocaine=darija.\\n' +\n  'ESCALADE (STRICT): escalade_requise=true UNIQUEMENT si insulte, plainte service, ou hors sujet total (bitcoin, politique...). Questions prix/offres/packs/reservation/annulation/report en FR, EN, AR ou darija (ex: chno les offres, bghit ndir reservation, شحال, how much) → escalade_requise=false TOUJOURS. Ne jamais escalader faute de comprendre la langue.\\nSi plainte / mecontentement / j aime pas / mauvais service → intention=reclamation et escalade_requise=true.\\n' +\n  'Si insulte ou hors studio → escalade_requise=true.\\n' +\n  'Si annule/cancel → intention=annulation.\\n' +\n  'Si report/replanifier/reschedule/reprogrammer/décaler/changer mon rdv → intention=reschedule (meme si le message contient demain/jour/heure).\\n' +\n  'Si nouvelle reservation (sans report) avec jour/heure → intention=reservation.\\n' +\n  'Pour un report \"de X pour Y\" / \"pour X pour Y\", jour_demande = DESTINATION (Y), pas la date actuelle (X).\\n\\n' +\n  'Conversation:\\n' + conversationContext;\n\nconst openRouterAnalyzePayload = {\n  model: 'llama-3.1-8b-instant',\n  messages: [\n    { role: 'system', content: analyzeSystem },\n    { role: 'user', content: analyzeUser },\n  ],\n  temperature: 0.1,\n  max_tokens: 300,\n};\n\nreturn [{ json: {\n  ...p,\n  history,\n  storedLangue: c.langue || '',\n  lastIntention: c.lastIntention || '',\n  lastPrestation: c.lastPrestation || '',\n  lastPackName: c.lastPackName || c.packName || c.pack || '',\n  packName: c.packName || c.lastPackName || c.pack || '',\n  pack: c.pack || c.packName || c.lastPackName || '',\n  _askEnfants: !!c._askEnfants,\n  _askEnfantDob: !!c._askEnfantDob,\n  enfantPrenoms: Array.isArray(c.enfantPrenoms) ? c.enfantPrenoms : [],\n  storedPrenom: c.prenom || '',\n  pendingSlot: c.pendingSlot || '',\n  pendingSlug: c.pendingSlug || '',\n  pendingLink: c.pendingLink || '',\n  pendingPrestation: c.pendingPrestation || '',\n  pendingLabel: c.pendingLabel || '',\n  conversationContext,\n  openRouterAnalyzePayload,\n}}];\n"
+      },
+      "id": "f102bce1-c0d4-4176-823c-18469ad00d71",
+      "name": "Load Client Memory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        544
+      ],
+      "notes": "Analyze model: llama-3.1-8b-instant via Groq"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b839c11a-48f9-4651-8855-8be97a3ca133",
+              "leftValue": "={{ $json.escalated === true || $json.escalade_requise === true || $json.intention === 'reclamation' || $json.intention === 'spam' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "99b5fe6c-1135-4a0e-951d-0f20b5a09649",
+      "name": "Needs Escalation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5264,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\n// FORCE_ESC_REPLY_V53\nif (!String(j.finalResponse || '').trim()) {\n  const L = String(j.langue || 'FR');\n  j.finalResponse = /^en/i.test(L)\n    ? 'I understand — YOUR_ASSISTANT_NAME will take care of this personally and get back to you very soon.'\n    : 'Je comprends 🤍 YOUR_ASSISTANT_NAME s\\'en occupe personnellement et vous recontacte très vite.';\n  j.escalated = true;\n  j.escalade_requise = true;\n}\n\nfunction langFromLastMsg(text) {\n  const raw = String(text || '').trim();\n  const t = raw.toLowerCase();\n  if (/[\\u0600-\\u06FF]/.test(raw)) {\n    if (/بغيت|شحال|واش|لاباس|فين|كيفاش|بزاف|دابا|غادي|بغيتي|شنو|مزيان/.test(t)) return 'darija';\n    return 'AR';\n  }\n  if (/\\b(wach|bghit|chhal|chno|labas|smiti|chokran|wakha|3afak)\\b/i.test(t)) return 'darija';\n  if (/\\bj\\s*aime\\b|\\bjaime\\b|\\baime\\s+pas\\b|\\bpas\\s+content\\b|\\b(bonjour|salut|merci|svp|je\\s|tarif|prix|service|mauvais)\\b/i.test(t)\n      && !/\\b(hello|hi|hey|please|thanks)\\b/i.test(t)) return 'FR';\n  if (/\\b(hello|hi|hey|please|thanks|sorry|hate)\\b/i.test(t)\n      && !/\\b(bonjour|salut|merci|aime)\\b/i.test(t)) return 'EN';\n  return '';\n}\nconst langKey = (function (raw) {\n  const x = String(raw || 'FR').trim();\n  if (/^en/i.test(x)) return 'EN';\n  if (/^ar/i.test(x)) return 'AR';\n  if (/darija/i.test(x)) return 'darija';\n  return 'FR';\n})(langFromLastMsg(j.messageText) || j.langue);\n\nconst store = $getWorkflowStaticData('global');\nif (!store.escalations) store.escalations = [];\nconst displayId = j.instagramUsername || j.senderId;\nconst row = {\n  channel: j.channel,\n  senderId: displayId,\n  instagramUsername: j.instagramUsername || '',\n  igUserId: j.igUserId || '',\n  intention: j.intention,\n  langue: j.langue,\n  messageText: j.messageText,\n  at: new Date().toISOString(),\n};\nstore.escalations.unshift(row);\nif (store.escalations.length > 100) store.escalations.length = 100;\n\nfunction buildOwnerContactLink(j, displayId) {\n  const channel = String(j.channel || '').toLowerCase();\n  const raw = String(displayId || j.instagramUsername || j.senderId || '').trim();\n  if (channel === 'instagram') {\n    const user = String(j.instagramUsername || raw).replace(/^@/, '').trim();\n    if (user && !/^\\d{8,}$/.test(user)) {\n      return {\n        label: '@' + user,\n        link: 'https://www.instagram.com/' + encodeURIComponent(user) + '/',\n        how: 'Ouvrir Instagram / Meta Business Suite (compte YOUR_BUSINESS_NAME) → Boite de reception → repondre au DM de @' + user,\n      };\n    }\n    return {\n      label: raw || 'instagram',\n      link: 'https://business.facebook.com/latest/inbox/all',\n      how: 'Ouvrir Meta Business Suite → Inbox Instagram YOUR_BUSINESS_NAME → trouver la conversation et repondre',\n    };\n  }\n  // WhatsApp\n  const digits = String(raw).replace(/\\D/g, '');\n  if (digits.length >= 8) {\n    return {\n      label: '+' + digits,\n      link: 'https://wa.me/' + digits,\n      how: 'Cliquer le lien wa.me OU ouvrir WhatsApp Business (numero YOUR_BUSINESS_NAME) et ecrire a +' + digits,\n    };\n  }\n  return {\n    label: raw || 'client',\n    link: '',\n    how: 'Voir Airtable Escalations → colonne sender_id, puis contacter depuis WhatsApp Business / Instagram Inbox YOUR_BUSINESS_NAME',\n  };\n}\n\nconst contact = buildOwnerContactLink(j, displayId);\nconst text = [\n  'Escalade YOUR_BUSINESS_NAME',\n  'Canal: ' + j.channel,\n  'Client: ' + (contact.label || displayId),\n  'Intention: ' + j.intention,\n  j.foreignBookingAttempt ? 'Raison: tentative modification RDV d\\'un autre client' : '',\n  'Message: ' + j.messageText,\n  '',\n  '→ REPONDRE EN PERSONNE:',\n  contact.how,\n  contact.link ? ('Lien: ' + contact.link) : '',\n  'Inbox Meta: https://business.facebook.com/latest/inbox/all',\n].filter(Boolean).join('\\n');\n\n\nconst escalationReply = {\n  FR: \"Merci pour votre message. Je m'en occupe personnellement et je vous reponds très vite.\",\n  EN: \"Thank you for your message. I will take care of this personally and reply to you very soon.\",\n  AR: \"شكرا على رسالتك. تم تمرير طلبك إلى سكينة التي سترد عليك شخصيا قريبا.\",\n  darija: \"Chokran 3la message dyalek. Ghadi n3tani biha personnellement w njawbek qrib.\",\n};\nconst reclamationReply = {\n  FR: \"Je suis désolée pour ce désagrément. Je vous contacte personnellement très vite.\",\n  EN: \"I am sorry about this. I will contact you personally very soon.\",\n  AR: \"آسفة على هذا الإزعاج. سكينة ستواصل معك شخصيا قريبا.\",\n  darija: \"Smah liya. Ghadi ncontactik personnellement.\",\n};\n\nlet userReply = j.finalResponse;\nconst forceApology = j.intention === 'reclamation' || j.escalated || j.escalade_requise;\nif (forceApology || !userReply || !String(userReply).trim()) {\n  const isRec = j.intention === 'reclamation' || /aime\\s*pas|m[eé]content|plainte|bad\\s*service/i.test(String(j.messageText || ''));\n  userReply = isRec\n    ? (reclamationReply[langKey] || reclamationReply.FR)\n    : (escalationReply[langKey] || escalationReply.FR);\n}\n\n\n// Airtable Escalations.intention is often a Single select — only known options allowed\n// Error seen: Insufficient permissions to create new select option \"tarif\"\nfunction sanitizeEscalationIntention(raw, msg, foreign) {\n  const t = String(raw || '').toLowerCase();\n  const m = String(msg || '').toLowerCase();\n  // Airtable Single select options (existing): reclamation, spam — do NOT send tarif/reservation\n  if (t === 'reclamation' || /plainte|rembours|insulte|connard|nul|horrible|aime\\s*pas|mauvais\\s*service/i.test(m)) return 'reclamation';\n  // foreign attempt, hors sujet, bitcoin, etc. → spam (option exists)\n  return 'spam';\n}\n\nfunction escalationRaison(j) {\n  if (j.foreignBookingAttempt) return 'foreign_booking';\n  const m = String(j.messageText || '').toLowerCase();\n  if (/bitcoin|crypto|forex|nft|casino/i.test(m)) return 'hors_sujet';\n  if (/connard|pute|salope|fuck|insulte/i.test(m)) return 'insulte';\n  if (/rembours|plainte|aime\\s*pas|mauvais/i.test(m)) return 'plainte_service';\n  return 'escalade';\n}\n\nconst at_intention = sanitizeEscalationIntention(j.intention, j.messageText, j.foreignBookingAttempt);\nconst at_raison = escalationRaison(j);\n\nreturn [{ json: {\n  ...j,\n  intention: at_intention,\n  at_intention,\n  at_raison,\n  instagramUsername: j.instagramUsername || '',\n  igUserId: j.igUserId || '',\n  senderId: displayId || j.senderId,\n  at_sender_id: displayId || j.instagramUsername || j.senderId,\n  finalResponse: userReply,\n  escalationLogged: true,\n  notifyText: text,\n  ownerContactLink: contact.link || '',\n  ownerContactHow: contact.how || '',\n  telegramBot: 'YOUR_TELEGRAM_BOT_TOKEN',\n  telegramChat: 'YOUR_TELEGRAM_CHAT_ID',\n}}];\n"
+      },
+      "id": "1faa235c-32ec-4cc0-8652-895eba480e89",
+      "name": "Log Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5488,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/botYOUR_TELEGRAM_BOT_TOKEN/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { chat_id: $json.telegramChat, text: $json.notifyText, disable_web_page_preview: false } }}",
+        "options": {}
+      },
+      "id": "bb5809ae-b8cc-46c2-9fcf-8313029ea59a",
+      "name": "Notify Telegram (optional)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5712,
+        832
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "notes": "Activer: renseigner TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID dans build_workflow_v2.py"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b574890f-848f-4e14-89d3-7203c066f8ac",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "whatsapp",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "77a3c92e-0b0c-4887-a1ef-c7c8a1b22246",
+      "name": "Channel Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5712,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v25.0/YOUR_META_PAGE_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { messaging_type: \"RESPONSE\", recipient: { id: $json.igUserId || $json.senderId }, message: { text: $json.finalResponse } } }}",
+        "options": {},
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "59c5793a-6cca-4a5c-9432-f6d0d167c239",
+      "name": "Send Instagram DM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5936,
+        416
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Meta Instagram Page Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v25.0/YOUR_WHATSAPP_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { messaging_product: \"whatsapp\", to: $json.senderId, type: \"text\", text: { body: $json.finalResponse } } }}",
+        "options": {},
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "b7b33410-4836-4e67-9fca-99135df04869",
+      "name": "Send WhatsApp Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5936,
+        224
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "notes": "WA test +15556773742",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Meta WhatsApp Cloud Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Resolve context even when booking path was skipped (audio fallback, tarif, etc.)\nfunction fromNode(name) {\n  try {\n    const ref = $(name);\n    if (ref && typeof ref.isExecuted === 'boolean' && !ref.isExecuted) return null;\n    return ref.first().json;\n  } catch (e) {\n    return null;\n  }\n}\nconst j = fromNode('Format Agent Reply')\n  || fromNode('Parse Booking Result')\n  || fromNode('Audio Fallback Message')\n  || fromNode('Guardrails Check')\n  || fromNode('Prepare Booking')\n  || fromNode('Audio')\n  || fromNode('Merge Text')\n  || $input.first().json;\n\n\n// Airtable Leads.langue is often Single select with only FR/EN/AR — \"darija\" is rejected\nfunction sanitizeAirtableLangue(raw) {\n  const x = String(raw || 'FR').trim();\n  if (/^en/i.test(x)) return 'EN';\n  if (/^ar/i.test(x)) return 'AR';\n  // Map darija → FR for Airtable (bot keeps langue=darija for replies)\n  if (/darija/i.test(x)) return 'FR';\n  if (/^fr/i.test(x)) return 'FR';\n  return 'FR';\n}\n\n\nfunction airtableSenderId(j, prev) {\n  const cand = [\n    j.instagramUsername,\n    prev && prev.instagramUsername,\n    j.senderId,\n  ];\n  for (const c of cand) {\n    const s = String(c || '').replace(/^@/, '').trim();\n    if (s && !/^\\d{8,}$/.test(s)) return s;\n  }\n  return String(j.senderId || j.igUserId || '');\n}\n\n\nfunction formatReservationDates(bookings, fallbackIso, fallbackLabel) {\n  const lines = [];\n  const seen = new Set();\n  const arr = Array.isArray(bookings) ? bookings : [];\n  for (const b of arr) {\n    if (!b || b.annule) continue;\n    const when = String(b.label || b.scheduled_at || '').trim();\n    if (!when || seen.has(when)) continue;\n    seen.add(when);\n    const bits = [b.prestation, b.packName].filter(Boolean);\n    lines.push(bits.length ? (when + ' — ' + bits.join(' / ')) : when);\n  }\n  const fb = String(fallbackLabel || fallbackIso || '').trim();\n  if (!lines.length && fb && !seen.has(fb)) lines.push(fb);\n  return lines.join('\\n');\n}\n\nconst store = $getWorkflowStaticData('global');\nif (!store.clients) store.clients = {};\nif (!store.logs) store.logs = [];\nconst memKey = j.igUserId || j.senderId;\nconst prev = store.clients[memKey] || store.clients[j.senderId] || {};\nconst prenomRaw = (j.prenom && j.prenom !== 'chere cliente' && j.prenom !== 'chère cliente')\n  ? j.prenom\n  : (j.clientName || prev.prenom || j.prenom);\nfunction cleanPrenomCrm(raw) {\n  let t = String(raw || '').trim().replace(/\\s+/g, ' ');\n  if (!t || t.length > 40 || t.split(' ').length > 3) return '';\n  if (/^(cliente\\s+YOUR_BUSINESS_NAME|ch[eè]re\\s+cliente)$/i.test(t)) return '';\n  if (/\\b(annul|reserv|rendez|voudrais|bonjour|bonsoir|couple|famille|newborn|grossesse|cake|vip|diamond|reporter|email|s[eé]ance|shooting|pack|merci|votre|vos|vous|de|du|des)\\b/i.test(t)) return '';\n  if (!/^[A-Za-zÀ-ÿ\\u0600-\\u06FF][A-Za-zÀ-ÿ\\u0600-\\u06FF'’\\- ]{1,39}$/.test(t)) return '';\n  return t;\n}\nconst prenom = cleanPrenomCrm(prenomRaw) || cleanPrenomCrm(prev.prenom) || '';\n\nconst ts = new Date().toLocaleString('sv-SE', { timeZone: 'Africa/Casablanca' }).slice(0, 16);\nconst turn = '[' + ts + '] Client: ' + (j.messageText || '') + '\\n[' + ts + '] YOUR_ASSISTANT_NAME: ' + (j.finalResponse || '');\nlet prevHist = String(prev.conversationFull || '').trim();\nif (prevHist) {\n  prevHist = prevHist.split(/\\n+/).filter((ln) => ln.trim() && !/^C:\\s/i.test(ln) && !/^B:\\s/i.test(ln)).join('\\n');\n}\n// Dedupe: Format used to append the same turn — skip if last Client line is identical\nconst msgSnap = String(j.messageText || '').trim().slice(0, 300);\nconst lastClient = (prevHist.match(/\\[.*?\\] Client: (.*)$/m) || [])[1] || '';\nconst alreadyLogged = msgSnap && lastClient === msgSnap\n  && prevHist.indexOf(lastClient) >= 0\n  && prevHist.lastIndexOf('] YOUR_ASSISTANT_NAME:') > prevHist.lastIndexOf('] Client:');\nconst conversationFull = alreadyLogged\n  ? prevHist\n  : ((prevHist ? prevHist + '\\n' : '') + turn);\nconst conversationTrimmed = conversationFull.slice(-12000);\n\nconst msgLower = String(j.messageText || '').trim().toLowerCase();\nconst stopOptOut = /^(stop|arrêt|arret|arreter|arrêter|unsubscribe|ne plus ecrire|ne plus écrire)$/i.test(msgLower);\n\nconst appointment_id = (j.appointment_id !== undefined) ? j.appointment_id : (prev.lastBookingUid || prev.bookingUid || '');\nconst scheduled_at = (j.scheduled_at !== undefined && j.scheduled_at !== '') ? j.scheduled_at : (prev.scheduled_at || '');\nconst annule = (j.annule !== undefined) ? !!j.annule : !!prev.annule;\nconst reporte = (j.reporte !== undefined) ? !!j.reporte : !!prev.reporte;\nconst status = stopOptOut ? 'STOP' : (prev.status === 'STOP' ? 'STOP' : 'ACTIVE');\n\nconst myBookings = Array.isArray(j.myBookings) && j.myBookings.length\n  ? j.myBookings\n  : (Array.isArray(prev.myBookings) ? prev.myBookings : []);\nconst reservation_dates = formatReservationDates(\n  myBookings,\n  scheduled_at,\n  j.chosenLabel || prev.lastBookingLabel || ''\n);\n\nstore.clients[memKey] = {\n  ...prev,\n  prenom,\n  langue: j.langue,\n  channel: j.channel,\n  history: conversationTrimmed.slice(-3500),\n  conversationFull: conversationTrimmed,\n  lastIntention: j.intention,\n  lastPrestation: j.prestation || prev.lastPrestation || '',\n  lastPackName: j.packName || prev.lastPackName || '',\n  packName: j.packName || prev.packName || prev.lastPackName || '',\n  pack: j.pack || j.packName || prev.packName || prev.lastPackName || '',\n  igUserId: j.igUserId || prev.igUserId || '',\n  instagramUsername: j.instagramUsername || prev.instagramUsername || '',\n  clientEmail: j.clientEmail || prev.clientEmail || '',\n  bookingCreated: !!j.bookingCreated || !!prev.bookingCreated,\n  calBookingLink: j.lien_reservation || j.calBookingLink || j.booking_link || prev.calBookingLink || '',\n  lastBookingUid: (j.appointment_id !== undefined) ? String(j.appointment_id || '') : (appointment_id || prev.lastBookingUid || ''),\n  bookingUid: (j.appointment_id !== undefined) ? String(j.appointment_id || '') : (appointment_id || prev.bookingUid || ''),\n  bookingOwnerSenderId: ((j.appointment_id !== undefined) && !j.appointment_id) ? '' : (prev.bookingOwnerSenderId || (appointment_id ? j.senderId : '')),\n  scheduled_at,\n  myBookings,\n  reservation_dates,\n  lastBookingLabel: j.chosenLabel || prev.lastBookingLabel || '',\n  annule,\n  reporte,\n  status,\n  followup_count: prev.followup_count || 0,\n  last_followup_at: prev.last_followup_at || '',\n  last_message_at: new Date().toISOString(),\n  escalated: !!j.escalated,\n  updatedAt: new Date().toISOString(),\n  enfants: Array.isArray(j.enfants) ? j.enfants : (prev.enfants || []),\n  enfantPrenoms: Array.isArray(j.enfant_prenoms) ? j.enfant_prenoms : (prev.enfantPrenoms || []),\n  theme: j.theme || prev.theme || '',\n  bookingNotes: j.bookingNotes || j.notes || prev.bookingNotes || '',\n  notes: j.notes || j.bookingNotes || prev.notes || '',\n  enfant_remarques: j.enfant_remarques || prev.enfant_remarques || '',\n  bookingCreated: !!j.bookingCreated || !!prev.bookingCreated,\n  bookingUpdated: !!j.bookingUpdated || !!prev.bookingUpdated,\n};\n\nif (stopOptOut && !j.escalated) {\n  // soft override reply if pure STOP\n  j.finalResponse = (j.langue || 'FR').toUpperCase() === 'EN'\n    ? 'Understood — I will not send follow-up messages anymore. You can write anytime if you need the studio.'\n    : 'C\\'est note — je ne vous enverrai plus de messages de suivi. Ecrivez-moi quand vous voulez pour le studio.';\n}\n\nstore.logs.unshift({\n  senderId: j.senderId,\n  intention: j.intention,\n  langue: j.langue,\n  escalated: !!j.escalated,\n  bookingCreated: !!j.bookingCreated,\n  at: new Date().toISOString()\n});\nif (store.logs.length > 200) store.logs.length = 200;\n\nconst c = store.clients[memKey] || store.clients[j.senderId];\n\nfunction isoOrBlank(v) {\n  const s = String(v || '').trim();\n  if (!s) return '';\n  // Airtable dateTime rejects empty string — only pass real ISO-like values\n  if (!/^\\d{4}-\\d{2}-\\d{2}/.test(s)) return '';\n  return s;\n}\nfunction emailOrBlank(v) {\n  const s = String(v || '').trim();\n  if (!s || !s.includes('@')) return '';\n  return s;\n}\n\nconst lastMsgAt = isoOrBlank(c.last_message_at) || new Date().toISOString();\nconst updatedAt = isoOrBlank(c.updatedAt) || lastMsgAt;\nconst sched = isoOrBlank(c.scheduled_at);\nconst lastFu = isoOrBlank(c.last_followup_at);\nconst email = emailOrBlank(j.clientEmail || c.clientEmail);\n\n// Persist ownership on CRM write\nc.bookingOwnerSenderId = c.bookingOwnerSenderId || (c.lastBookingUid ? j.senderId : '');\nstore.clients[j.senderId] = c;\n\nreturn [{ json: {\n  ...j,\n  logged: true,\n  prenom,\n  packName: j.packName || c.lastPackName || '',\n  lastPackName: j.packName || c.lastPackName || '',\n  pack: (j.pack || j.packName || c.lastPackName || '').toLowerCase() || '',\n  crmHistory: String(c.conversationFull || '').slice(0, 90000),\n  crmUpdatedAt: updatedAt,\n  appointment_id: c.lastBookingUid || '',\n  lien_reservation: c.calBookingLink || j.lien_reservation || j.calBookingLink || '',\n  scheduled_at: sched,\n  annule: !!c.annule,\n  reporte: !!c.reporte,\n  followup_count: Number(c.followup_count || 0),\n  last_followup_at: lastFu,\n  last_message_at: lastMsgAt,\n  status: (c.status === 'STOP' ? 'STOP' : 'ACTIVE'),\n  clientEmail: email,\n  airtableReady: true,\n  // Explicit Airtable-safe copies (empty dates omitted via expressions)\n  at_sender_id: airtableSenderId(j, prev),\n  at_langue: sanitizeAirtableLangue(j.langue),\n  at_scheduled_at: sched || null,\n  at_last_followup_at: lastFu || null,\n  at_last_message_at: lastMsgAt,\n  at_mis_a_jour: updatedAt,\n  at_client_email: email || null,\n  igUserId: j.igUserId || c.igUserId || '',\n  at_ig_user_id: (() => {\n    const a = String(j.igUserId || c.igUserId || '').trim();\n    if (/^\\d{5,}$/.test(a)) return a;\n    const ch = String(j.channel || '').toLowerCase();\n    const sid = String(j.senderId || '').trim();\n    if (ch === 'instagram' && /^\\d{5,}$/.test(sid)) return sid;\n    return a || null;\n  })(),\n  instagramUsername: j.instagramUsername || c.instagramUsername || '',\n  reservation_dates: c.reservation_dates || reservation_dates || '',\n  at_reservation_dates: (c.reservation_dates || reservation_dates || '') || null,\n  finalResponse: j.finalResponse,\n  enfants: Array.isArray(j.enfants) ? j.enfants : (c.enfants || []),\n  enfant_prenoms: Array.isArray(j.enfant_prenoms) ? j.enfant_prenoms : (c.enfantPrenoms || []),\n  enfantsCorrected: !!j.enfantsCorrected || !!c._enfantsCorrected,\n  date_naissance: j.date_naissance || ((Array.isArray(j.enfants) && j.enfants[0] && j.enfants[0].date_naissance) || ''),\n  theme: j.theme || c.theme || '',\n  notes: j.notes || j.bookingNotes || c.notes || c.bookingNotes || '',\n  bookingNotes: j.bookingNotes || j.notes || c.bookingNotes || '',\n  enfant_remarques: j.enfant_remarques || c.enfant_remarques || '',\n  bookingCreated: !!j.bookingCreated,\n  bookingUpdated: !!j.bookingUpdated,\n  previous_appointment_id: j.previous_appointment_id || '',\n  cancelled_appointment_id: j.cancelled_appointment_id || '',\n} }];\n"
+      },
+      "id": "277d4e5c-a02c-4284-bc24-7e1ab0f385f2",
+      "name": "Log & Update CRM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6160,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "YOUR_BUSINESS_NAME-test",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "dd4504f9-ec7b-449e-916a-8fd8a1293924",
+      "name": "Test Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -240,
+        752
+      ],
+      "webhookId": "2937c71b-7050-4e02-9cbc-bd34389ee801",
+      "notes": "POST JSON: {channel, senderId, messageText, messageType?}"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nasync function resolveInstagramUsername(igUserId, hints) {\n  const PAGE_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\n  const PAGE_ID = \"YOUR_META_PAGE_ID\";\n  const id = String(igUserId || '').trim();\n  function cleanUser(u) {\n    const s = String(u || '').replace(/^@/, '').trim();\n    if (!s) return '';\n    if (/^\\d{8,}$/.test(s)) return '';\n    return s;\n  }\n  let username = cleanUser(hints && (hints.instagramUsername || hints.username || hints.senderId));\n  if (username) return { username, igUserId: id, via: 'hint' };\n  if (!id || !/^\\d{5,}$/.test(id)) return { username: '', igUserId: id, via: 'no_igsid' };\n\n  // 1) User Profile API (works for any user who messaged the business)\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://graph.facebook.com/v21.0/' + id + '?fields=username,name,id',\n      headers: { Authorization: 'Bearer ' + PAGE_TOKEN },\n      json: true,\n      timeout: 12000,\n    });\n    username = cleanUser(res && res.username);\n    if (username) return { username, igUserId: id, name: res.name || '', via: 'profile' };\n  } catch (e) {}\n\n  // 2) Conversations participants\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://graph.facebook.com/v21.0/' + PAGE_ID + '/conversations',\n      qs: { platform: 'instagram', user_id: id, fields: 'participants', limit: 1 },\n      headers: { Authorization: 'Bearer ' + PAGE_TOKEN },\n      json: true,\n      timeout: 12000,\n    });\n    const parts = (((res || {}).data || [])[0] || {}).participants || {};\n    const arr = parts.data || [];\n    for (const p of arr) {\n      if (String(p.id) === String(id)) {\n        username = cleanUser(p.username);\n        if (username) return { username, igUserId: id, via: 'conversations' };\n      }\n    }\n    for (const p of arr) {\n      username = cleanUser(p.username);\n      if (username && String(p.id) !== String(PAGE_ID) && String(p.id) !== 'YOUR_INSTAGRAM_ACCOUNT_ID') {\n        return { username, igUserId: id, via: 'conversations_other' };\n      }\n    }\n  } catch (e) {}\n\n  return { username: '', igUserId: id, via: 'failed' };\n}\n\n\nconst j = $input.first().json || {};\nconst TOKEN = \"YOUR_AIRTABLE_PERSONAL_ACCESS_TOKEN\";\nconst BASE = \"YOUR_AIRTABLE_BASE_ID\";\nconst TABLE = \"YOUR_AIRTABLE_ESCALATIONS_TABLE_ID\";\n\nfunction s(v, max) {\n  const t = v == null ? '' : String(v);\n  return max ? t.slice(0, max) : t;\n}\n\nlet sender = s(j.instagramUsername || j.at_sender_id || j.senderId || '').trim();\nconst igsid = s(j.igUserId || '').trim() || (/^\\d{8,}$/.test(sender) ? sender : '');\nconst isIg = String(j.channel || '').toLowerCase() === 'instagram';\nif (isIg) {\n  const resolved = await resolveInstagramUsername(igsid || sender, j);\n  if (resolved.username) {\n    sender = resolved.username;\n    j.instagramUsername = resolved.username;\n  } else if (/^\\d{8,}$/.test(sender)) {\n    // keep trying: sender was IGSID and resolve failed — still store IGSID but mark\n    sender = s(j.senderId || igsid);\n  }\n}\nconst digits = (!isIg ? sender : '').replace(/\\D/g, '');\nconst senderNum = (!isIg && /^\\d{8,15}$/.test(digits)) ? Number(digits) : null;\nconst fields = {\n  sender_id: sender,\n  channel: s(j.channel),\n  intention: s(j.at_intention || j.intention || 'spam'),\n  langue: s(j.at_langue || (String(j.langue || '').toLowerCase() === 'darija' ? 'FR' : (j.langue || 'FR'))),\n  message: s(j.messageText, 5000),\n  reponse_bot: s(j.finalResponse || j.escalationReply || '', 5000),\n  prestation: s(j.prestation || ''),\n  date: new Date().toISOString(),\n  raison: s(j.foreignBookingAttempt ? 'tentative modification RDV autre client' : (j.escalationReason || j.intention || '')),\n};\n\nif (!isIg && senderNum != null && !Number.isNaN(senderNum)) fields.sender_id_num = senderNum;\nfor (const k of Object.keys(fields)) {\n  if (fields[k] === '' || fields[k] == null) delete fields[k];\n}\n\ntry {\n  const res = await this.helpers.httpRequest({\n    method: 'POST',\n    url: `https://api.airtable.com/v0/${BASE}/${TABLE}`,\n    headers: {\n      Authorization: 'Bearer ' + TOKEN,\n      'Content-Type': 'application/json',\n    },\n    body: { fields, typecast: true },\n    json: true,\n    timeout: 30000,\n  });\n  return [{ json: { ...j, airtableEscOk: true, airtableEscId: res?.id || '', airtableEscError: '' } }];\n} catch (e) {\n  return [{ json: { ...j, airtableEscOk: false, airtableEscError: String(e.message || e).slice(0, 800) } }];\n}\n"
+      },
+      "id": "c5da6a82-da51-4a22-ba9f-73fd6b35cc39",
+      "name": "Airtable Log Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5712,
+        640
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "notes": "Escalations PAT — https://airtable.com/YOUR_AIRTABLE_BASE_ID/YOUR_AIRTABLE_ESCALATIONS_TABLE_ID/viwCKJg9nmxHAU9jE"
+    },
+    {
+      "parameters": {
+        "jsCode": "async function resolveInstagramUsername(igUserId, hints) {\n  // Keep in sync with send dm / Fetch IG Username Page token\n  const PAGE_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\n  const PAGE_ID = \"YOUR_META_PAGE_ID\";\n  const id = String(igUserId || '').trim();\n  function cleanUser(u) {\n    const s = String(u || '').replace(/^@/, '').trim();\n    if (!s) return '';\n    if (/^\\d{8,}$/.test(s)) return '';\n    return s;\n  }\n  let username = cleanUser(hints && (hints.instagramUsername || hints.username || hints.senderId));\n  if (username) return { username, igUserId: id, via: 'hint' };\n  if (!id || !/^\\d{5,}$/.test(id)) return { username: '', igUserId: id, via: 'no_igsid' };\n\n  // 1) User Profile API (works for any user who messaged the business)\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://graph.facebook.com/v21.0/' + id + '?fields=username,name,id',\n      headers: { Authorization: 'Bearer ' + PAGE_TOKEN },\n      json: true,\n      timeout: 12000,\n    });\n    username = cleanUser(res && res.username);\n    if (username) return { username, igUserId: id, name: res.name || '', via: 'profile' };\n  } catch (e) {}\n\n  // 2) Conversations participants\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://graph.facebook.com/v21.0/' + PAGE_ID + '/conversations',\n      qs: { platform: 'instagram', user_id: id, fields: 'participants', limit: 1 },\n      headers: { Authorization: 'Bearer ' + PAGE_TOKEN },\n      json: true,\n      timeout: 12000,\n    });\n    const parts = (((res || {}).data || [])[0] || {}).participants || {};\n    const arr = parts.data || [];\n    for (const p of arr) {\n      if (String(p.id) === String(id)) {\n        username = cleanUser(p.username);\n        if (username) return { username, igUserId: id, via: 'conversations' };\n      }\n    }\n    for (const p of arr) {\n      username = cleanUser(p.username);\n      if (username && String(p.id) !== String(PAGE_ID) && String(p.id) !== 'YOUR_INSTAGRAM_ACCOUNT_ID') {\n        return { username, igUserId: id, via: 'conversations_other' };\n      }\n    }\n  } catch (e) {}\n\n  return { username: '', igUserId: id, via: 'failed' };\n}\n\n\nconst j = $input.first().json || {};\nconst TOKEN = \"YOUR_AIRTABLE_PERSONAL_ACCESS_TOKEN\";\nconst BASE = \"YOUR_AIRTABLE_BASE_ID\";\nconst TABLE = \"YOUR_AIRTABLE_LEADS_TABLE_ID\";\n\nfunction s(v, max) {\n  const t = v == null ? '' : String(v);\n  return max ? t.slice(0, max) : t;\n}\nfunction boolStr(v) {\n  return v === true || v === 'true' || v === 1 || v === '1' ? 'true' : 'false';\n}\nfunction escFormula(v) {\n  return String(v || '').replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\");\n}\n\nasync function atFind(formula) {\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.airtable.com/v0/${BASE}/${TABLE}`,\n    qs: { filterByFormula: formula, maxRecords: 5 },\n    headers: { Authorization: 'Bearer ' + TOKEN },\n    json: true,\n    timeout: 20000,\n  });\n  return res?.records || [];\n}\n\nasync function atWrite(fields, recordId) {\n  const body = recordId\n    ? { records: [{ id: recordId, fields }], typecast: true }\n    : { records: [{ fields }], typecast: true };\n  const res = await this.helpers.httpRequest({\n    method: recordId ? 'PATCH' : 'POST',\n    url: `https://api.airtable.com/v0/${BASE}/${TABLE}`,\n    headers: {\n      Authorization: 'Bearer ' + TOKEN,\n      'Content-Type': 'application/json',\n    },\n    body,\n    json: true,\n    timeout: 30000,\n  });\n  return res?.records?.[0] || null;\n}\n\nasync function atDelete(recordId) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'DELETE',\n      url: `https://api.airtable.com/v0/${BASE}/${TABLE}/${recordId}`,\n      headers: { Authorization: 'Bearer ' + TOKEN },\n      json: true,\n      timeout: 15000,\n    });\n  } catch (e) {}\n}\n\nfunction isIgUsername(u) {\n  const t = String(u || '').replace(/^@/, '').trim();\n  return !!(t && !/^\\d{5,}$/.test(t));\n}\n\nconst store = $getWorkflowStaticData('global');\nif (!store.igUsernames) store.igUsernames = {};\nif (!store.clients) store.clients = {};\n\nconst rawIg = s(j.igUserId || j.at_ig_user_id || j.ig_user_id || '').trim();\nconst channelRaw = String(j.channel || '').toLowerCase();\nconst hasExplicitIg = /^\\d{5,}$/.test(rawIg);\nlet igsid = hasExplicitIg ? rawIg : '';\n\n// Prefer human Instagram username (ex: ahmad_nouri) — already resolved by Apply IG Username\nlet username = '';\nfor (const c of [j.instagramUsername, j.at_sender_id, j.senderId]) {\n  const t = s(c).replace(/^@/, '').trim();\n  if (isIgUsername(t)) { username = t; break; }\n}\n// Only treat numeric sender as IGSID when channel is already Instagram\nconst numericSender = s(j.senderId || j.at_sender_id).trim();\nif (!igsid && channelRaw === 'instagram' && /^\\d{8,}$/.test(numericSender)) igsid = numericSender;\n\nif (!username && igsid) {\n  username = s(store.igUsernames[igsid] || (store.clients[igsid] && store.clients[igsid].instagramUsername)).replace(/^@/, '').trim();\n  if (!isIgUsername(username)) username = '';\n}\n\n// Instagram if channel says so OR explicit igUserId was provided\nconst isIg = channelRaw === 'instagram' || hasExplicitIg;\nif (isIg && channelRaw !== 'whatsapp') {\n  j.channel = 'instagram';\n}\n\nif (isIg) {\n  const resolved = await resolveInstagramUsername(igsid || '', {\n    ...j,\n    instagramUsername: username || j.instagramUsername,\n    senderId: username || j.senderId,\n  });\n  if (resolved.igUserId && /^\\d{5,}$/.test(String(resolved.igUserId))) {\n    igsid = String(resolved.igUserId);\n    j.igUserId = igsid;\n  }\n  if (resolved.username) {\n    username = resolved.username;\n    j.instagramUsername = username;\n    j.igUsernameResolved = true;\n    if (igsid) store.igUsernames[igsid] = username;\n  }\n}\n\n// sender_id = username (IG) or phone (WA). sender_id_num = IGSID or WA digits.\nif (!username && isIg) {\n  username = isIgUsername(j.instagramUsername) ? String(j.instagramUsername).replace(/^@/, '').trim() : '';\n}\nconst finalIgsid = igsid || '';\nlet sender = username;\nif (!sender && isIg && finalIgsid) {\n  // Last-resort fallback: keep the conversation visible in Leads even if Meta username lookup is temporarily blocked.\n  sender = 'ig_' + finalIgsid;\n  j.instagramUsername = sender;\n  j.igUsernameResolved = false;\n  j.igProfileError = j.igProfileError || 'username_unresolved_fallback';\n}\nif (!sender && !isIg) {\n  sender = s(j.at_sender_id || j.senderId || '').trim();\n}\nif (!isIg && !sender) {\n  return [{ json: { ...j, airtableOk: false, airtableError: 'missing_sender_id' } }];\n}\nconst digits = String(sender || '').replace(/\\D/g, '');\nconst senderNum = (!isIg && /^\\d{8,15}$/.test(digits)) ? Number(digits) : null;\n\nconst fields = {\n  sender_id: sender || finalIgsid || 'unknown',\n  prenom: s(j.prenom),\n  channel: isIg ? 'instagram' : s(j.channel),\n  langue: s(j.at_langue || (String(j.langue || '').toLowerCase() === 'darija' ? 'FR' : (j.langue || 'FR'))),\n  intention: s(j.intention || 'autre'),\n  prestation: s(j.prestation || 'inconnu'),\n  pack: s(j.pack || j.packName || j.lastPackName || '').toLowerCase(),\n  dernier_message: s(j.messageText, 5000),\n  reponse_bot: s(j.finalResponse, 5000),\n  historique: s(j.crmHistory, 90000),\n  escalade: boolStr(j.escalated),\n  appointment_id: s(j.appointment_id),\n  scheduled_at: s(j.at_scheduled_at || j.scheduled_at || ''),\n  lien_reservation: s(j.lien_reservation || j.calBookingLink || j.booking_link || ''),\n  reservation_dates: s(j.at_reservation_dates || j.reservation_dates || ''),\n  annule: boolStr(j.annule),\n  reporte: boolStr(j.reporte),\n  followup_count: Number(j.followup_count || 0) || 0,\n  last_followup_at: s(j.at_last_followup_at || j.last_followup_at || ''),\n  status: j.status === 'STOP' ? 'STOP' : 'ACTIVE',\n  client_email: s(j.at_client_email || j.client_email || ''),\n};\n\n// Only write valid pack choices (Airtable singleSelect)\nif (!/^(basic|prestige|vip|diamond|mini)$/.test(String(fields.pack || ''))) delete fields.pack;\nconst mis = j.at_mis_a_jour || j.crmUpdatedAt || new Date().toISOString();\nconst lastMsg = j.at_last_message_at || j.last_message_at || new Date().toISOString();\nif (mis) fields.mis_a_jour = mis;\nif (lastMsg) fields.last_message_at = lastMsg;\n\n// Drop empty optional strings so Airtable does not wipe with \"\"\nfor (const k of Object.keys(fields)) {\n  if (fields[k] === '' || fields[k] === undefined || fields[k] === null) delete fields[k];\n}\nif (!isIg && senderNum != null && !Number.isNaN(senderNum)) fields.sender_id_num = senderNum;\nif (isIg && finalIgsid && /^\\d{5,}$/.test(String(finalIgsid))) fields.sender_id_num = Number(finalIgsid);\n\ntry {\n  // Find existing row by ig_user_id OR sender_id(=igsid or username) to avoid duplicates\n  const found = [];\n  const seen = new Set();\n  const formulas = [];\n  if (finalIgsid) {\n    formulas.push(`OR({sender_id}='${escFormula(finalIgsid)}',{sender_id_num}=${Number(finalIgsid)})`);\n  }\n  if (username) {\n    formulas.push(`{sender_id}='${escFormula(username)}'`);\n  }\n  if (!formulas.length && sender) {\n    formulas.push(`{sender_id}='${escFormula(sender)}'`);\n  }\n  for (const fml of formulas) {\n    const rows = await atFind.call(this, fml);\n    for (const r of rows) {\n      if (seen.has(r.id)) continue;\n      seen.add(r.id);\n      found.push(r);\n    }\n  }\n  found.sort((a, b) => {\n    const ag = (a.fields && a.fields.sender_id_num) ? 1 : 0;\n    const bg = (b.fields && b.fields.sender_id_num) ? 1 : 0;\n    if (bg !== ag) return bg - ag;\n    const au = isIgUsername(a.fields && a.fields.sender_id) ? 1 : 0;\n    const bu = isIgUsername(b.fields && b.fields.sender_id) ? 1 : 0;\n    return bu - au;\n  });\n\n  const primary = found[0] || null;\n  // Never overwrite a stored username with a numeric IGSID (Instagram only)\n  if (isIg && primary) {\n    const existingSid = s(primary.fields && primary.fields.sender_id).replace(/^@/, '').trim();\n    if (!isIgUsername(sender) && isIgUsername(existingSid)) {\n      sender = existingSid;\n      username = existingSid;\n      j.instagramUsername = existingSid;\n    }\n  }\n  if (isIg) {\n    if (!isIgUsername(sender)) sender = username || '';\n    if (isIgUsername(sender)) {\n      fields.sender_id = sender;\n    } else if (!primary) {\n      // New IG lead without username yet: skip numeric fake id\n      return [{ json: {\n        ...j,\n        channel: fields.channel || j.channel,\n        igUserId: finalIgsid || j.igUserId || '',\n        airtableOk: false,\n        airtableError: 'ig_username_unresolved',\n        airtableMergeOn: 'skip',\n      } }];\n    } else {\n      delete fields.sender_id;\n    }\n  } else {\n    // WhatsApp / other: phone (or text id) is a valid sender_id\n    if (!sender) {\n      return [{ json: { ...j, airtableOk: false, airtableError: 'missing_sender_id' } }];\n    }\n    fields.sender_id = sender;\n  }\n\n  if (isIg && !fields.sender_id && !primary) {\n    return [{ json: { ...j, airtableOk: false, airtableError: 'missing_sender_id' } }];\n  }\n\n  const saved = await atWrite.call(this, fields, primary ? primary.id : '');\n  // Clean orphan duplicates for same Instagram person\n  if (finalIgsid && found.length > 1) {\n    for (const r of found.slice(1)) {\n      const sid = String((r.fields && r.fields.sender_id) || '');\n      const num = String((r.fields && r.fields.sender_id_num) || '');\n      if (sid === finalIgsid || num === finalIgsid || (username && sid === username) || (sender && sid === sender)) {\n        await atDelete.call(this, r.id);\n      }\n    }\n  }\n\n  return [{ json: {\n    ...j,\n    channel: fields.channel || j.channel,\n    igUserId: finalIgsid || j.igUserId || '',\n    instagramUsername: username || j.instagramUsername || (isIgUsername(sender) ? sender : ''),\n    senderId: isIgUsername(sender) ? sender : (j.senderId || sender),\n    airtableOk: true,\n    airtableRecordId: saved?.id || (primary && primary.id) || '',\n    airtableError: '',\n    airtableMergeOn: primary ? 'find_patch' : 'create',\n  } }];\n} catch (e) {\n  return [{ json: {\n    ...j,\n    igUserId: finalIgsid || j.igUserId || '',\n    airtableOk: false,\n    airtableError: String(e.message || e).slice(0, 800),\n  } }];\n}\n"
+      },
+      "id": "4ee0379d-43d0-44c8-afc5-11f5a4dee265",
+      "name": "Airtable Upsert Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6384,
+        320
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "notes": "Leads PAT — https://airtable.com/YOUR_AIRTABLE_BASE_ID/YOUR_AIRTABLE_LEADS_TABLE_ID/viwYdQpdEFcYKmfI9"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ac1dc85a-1576-4d39-a968-76aa62d011a8",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "instagram"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e6812e3e-98c8-4cd7-b5a1-70dcb26d11ee",
+      "name": "Is Instagram Channel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        448,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ /^\\d+$/.test(String($json.igUserId||'')) ? $json.igUserId : (/^\\d+$/.test(String($json.senderId||'')) ? $json.senderId : $json.igUserId) }}?fields=username,name,profile_pic",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer YOUR_META_ACCESS_TOKEN"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "ade4949a-ecd6-4a54-a88d-44adc492f912",
+      "name": "Fetch IG Username",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        672,
+        336
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Normalize & Filter').first().json;\nconst profile = $input.first().json || {};\nconst store = $getWorkflowStaticData('global');\nif (!store.igUsernames) store.igUsernames = {};\nif (!store.clients) store.clients = {};\n\nconst PAGE_ID = \"YOUR_META_PAGE_ID\";\nconst PAGE_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\n\nfunction cleanUser(u) {\n  const s = String(u || '').replace(/^@/, '').trim();\n  if (!s) return '';\n  if (/^\\d{5,}$/.test(s)) return '';\n  return s;\n}\n\n// Always keep numeric IGSID for Graph send DM\nlet igUserId = String(base.igUserId || '').trim();\nif (!/^\\d{5,}$/.test(igUserId)) {\n  const fromSender = String(base.senderId || '').trim();\n  igUserId = /^\\d{5,}$/.test(fromSender) ? fromSender : '';\n}\n\nlet username = cleanUser(\n  profile.username\n  || (profile.data && profile.data.username)\n  || base.instagramUsername\n  || (igUserId && store.igUsernames[igUserId])\n  || ''\n);\n\nconst prev = (igUserId && store.clients[igUserId]) || store.clients[base.senderId] || {};\nif (!username) username = cleanUser(prev.instagramUsername);\n\nlet via = username ? 'hint_or_fetch' : '';\nlet lastErr = '';\n\n// ALWAYS resolve via Graph User Profile when still missing (definitive)\nif (!username && igUserId && PAGE_TOKEN) {\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://graph.facebook.com/v21.0/' + encodeURIComponent(igUserId),\n      qs: { fields: 'username,name,id' },\n      headers: { Authorization: 'Bearer ' + PAGE_TOKEN },\n      json: true,\n      timeout: 12000,\n    });\n    username = cleanUser(res && res.username);\n    if (username) via = 'graph_profile';\n    else lastErr = 'graph_no_username';\n  } catch (e) {\n    lastErr = String((e && e.message) || e).slice(0, 200);\n  }\n}\n\n// Fallback: conversations participants\nif (!username && igUserId && PAGE_TOKEN) {\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://graph.facebook.com/v21.0/' + PAGE_ID + '/conversations',\n      qs: { platform: 'instagram', user_id: igUserId, fields: 'participants', limit: 1 },\n      headers: { Authorization: 'Bearer ' + PAGE_TOKEN },\n      json: true,\n      timeout: 12000,\n    });\n    const parts = ((((res || {}).data || [])[0] || {}).participants || {}).data || [];\n    for (const p of parts) {\n      if (String(p.id) === String(igUserId)) {\n        const u = cleanUser(p.username);\n        if (u) { username = u; via = 'conversations'; break; }\n      }\n    }\n    if (!username) {\n      for (const p of parts) {\n        const u = cleanUser(p.username);\n        if (u && String(p.id) !== String(PAGE_ID)) { username = u; via = 'conversations_other'; break; }\n      }\n    }\n  } catch (e) {\n    if (!lastErr) lastErr = String((e && e.message) || e).slice(0, 200);\n  }\n}\n\nif (username && igUserId) {\n  store.igUsernames[igUserId] = username;\n  const c = store.clients[igUserId] || {};\n  c.instagramUsername = username;\n  c.igUserId = igUserId;\n  store.clients[igUserId] = c;\n  // alias under username for lookups\n  store.clients[username] = Object.assign({}, store.clients[username] || {}, c);\n}\n\n// Visible CRM id = username. Numeric IGSID stays in igUserId only.\nconst senderId = username || String(base.senderId || igUserId || '');\n\nreturn [{ json: {\n  ...base,\n  channel: 'instagram',\n  igUserId,\n  instagramUsername: username,\n  senderId,\n  sessionId: igUserId || senderId,\n  igUsernameResolved: !!username,\n  igUsernameVia: via || '',\n  igProfileError: username ? '' : (lastErr || String((profile.error && profile.error.message) || profile.error || 'username_unresolved')),\n} }];\n"
+      },
+      "id": "f4e0c9f3-6abb-404d-aa8b-5d99413f0db2",
+      "name": "Apply IG Username",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        336
+      ],
+      "notes": "Resolve @username via profile + conversations + User Profile API (v21)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-url",
+              "leftValue": "={{ !!$json.url }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c9b35c2e-8de4-4ffc-911f-0767f50299cf",
+      "name": "Has Media URL?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2016,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.metaToken }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "0313f52b-ab6c-4787-a085-9ad1341df502",
+      "name": "Download Audio File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2240,
+        352
+      ],
+      "continueOnFail": true,
+      "notes": "Community: responseFormat=file binary key data"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/audio/transcriptions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "model",
+              "value": "whisper-large-v3"
+            },
+            {
+              "name": "response_format",
+              "value": "json"
+            },
+            {
+              "name": "temperature",
+              "value": "0"
+            },
+            {
+              "name": "language",
+              "value": "fr"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "c6ae6346-c0f3-4e5d-bb4d-94cfbc08c45c",
+      "name": "Whisper Groq",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2464,
+        352
+      ],
+      "continueOnFail": true,
+      "notes": "n8n template 6077 pattern: multipart Whisper via Groq",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Groq API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const prep = $('Prepare Audio Meta').first().json;\nconst WA_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\nconst PAGE_TOKEN = \"YOUR_META_ACCESS_TOKEN\";\nconst directUrl = String(prep.url || prep.mediaUrl || '').trim();\nconst mediaId = String(prep.mediaId || '').trim();\nif (!mediaId) {\n  if (directUrl) {\n    return [{ json: { ...prep, url: directUrl, transcriptionFailed: false, audioError: '' } }];\n  }\n  return [{ json: { ...prep, url: '', transcriptionFailed: true, audioError: 'missing_mediaId' } }];\n}\nconst tokens = prep.channel === 'instagram'\n  ? [PAGE_TOKEN, WA_TOKEN]\n  : [WA_TOKEN, PAGE_TOKEN];\nconst versions = ['v21.0', 'v22.0', 'v19.0', 'v18.0'];\nlet lastErr = '';\nfor (const token of tokens) {\n  for (const ver of versions) {\n    try {\n      const meta = await this.helpers.httpRequest({\n        method: 'GET',\n        url: 'https://graph.facebook.com/' + ver + '/' + mediaId,\n        headers: { Authorization: 'Bearer ' + token },\n        json: true,\n        timeout: 30000,\n      });\n      if (meta && meta.url) {\n        return [{ json: {\n          ...prep,\n          metaToken: token,\n          url: meta.url,\n          audioMimeType: meta.mime_type || prep.audioMimeType || 'audio/ogg',\n          transcriptionFailed: false,\n          audioError: '',\n          graphVer: ver,\n        } }];\n      }\n      lastErr = JSON.stringify(meta || {}).slice(0, 200);\n    } catch (e) {\n      lastErr = String(e.message || e);\n    }\n  }\n}\nreturn [{ json: { ...prep, url: '', transcriptionFailed: true, audioError: 'graph:' + lastErr.slice(0, 200) } }];\n"
+      },
+      "id": "664473c5-a644-4f23-b7f2-1f56305e236a",
+      "name": "Resolve Media URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        272
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "notes": "Try Send-WA token first across Graph versions"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only forward to Airtable update when Graph send succeeded\nconst sends = $input.all();\nconst parses = $('Parse Follow-Up Text').all();\nconst out = [];\n\nfor (let i = 0; i < sends.length; i++) {\n  const send = sends[i].json || {};\n  const ctx = (parses[i] && parses[i].json) || {};\n  const err = send.error || send.error_data || (send.error && send.error.message);\n  const hasMsg =\n    !!(send.message_id\n      || (Array.isArray(send.messages) && send.messages[0] && (send.messages[0].id || send.messages[0].message_id))\n      || (send.id && !send.error));\n  const ok = !err && hasMsg;\n  if (!ok) continue;\n  out.push({\n    json: {\n      ...ctx,\n      sendOk: true,\n      graphMessageId: send.message_id || (send.messages && send.messages[0] && send.messages[0].id) || send.id || '',\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "da395d7b-3f52-4ddb-b89a-e79732286324",
+      "name": "Check Follow-Up Send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        1360
+      ],
+      "notes": "Update Airtable ONLY if IG/WA send succeeded"
+    },
+    {
+      "parameters": {
+        "jsCode": "// CRM Sync Relational — Clients / Enfants / Séances\n// Après Airtable Upsert Lead. Soft-fail si tables absentes.\nconst TOKEN = \"YOUR_AIRTABLE_PERSONAL_ACCESS_TOKEN\";\nconst BASE = \"YOUR_AIRTABLE_BASE_ID\";\nconst T_CLIENTS = \"Clients\";\nconst T_ENFANTS = \"Enfants\";\nconst T_SEANCES = \"Séances\";\n\nconst j = $input.first().json || {};\n\nfunction s(v, max) {\n  const t = v == null ? \"\" : String(v);\n  return max ? t.slice(0, max) : t;\n}\n\nfunction escFormula(v) {\n  return String(v || \"\").replace(/\\\\/g, \"\\\\\\\\\").replace(/'/g, \"\\\\'\");\n}\n\nfunction sanitizeLangue(raw) {\n  const x = String(raw || \"FR\").trim();\n  if (/^en/i.test(x)) return \"EN\";\n  if (/^ar/i.test(x)) return \"AR\";\n  return \"FR\";\n}\n\n/** Never store intents / sentences as a person name */\nfunction cleanPersonName(raw) {\n  let t = String(raw || \"\").trim().replace(/\\s+/g, \" \");\n  if (!t) return \"\";\n  if (/^(cliente\\s+YOUR_BUSINESS_NAME|ch[eè]re\\s+cliente)$/i.test(t)) return \"\";\n  if (t.length > 40) return \"\";\n  if (t.split(\" \").length > 3) return \"\";\n  // Junk typos that must never become Enfants rows\n  if (/^(.)\\1+$/i.test(t)) return \"\";\n  if (t.length <= 3 && !/[aeiouyàâäéèêëïîôùûüœ]/i.test(t) && !/[\\u0600-\\u06FF]/.test(t)) return \"\";\n  if (/[@/\\\\d]/.test(t) && /@/.test(t)) return \"\";\n  if (/\\b(annul|reserv|rendez[- ]?vous|voudrais|voudrait|bonjour|bonsoir|salut|couple|famille|newborn|grossesse|cake|smash|vip|diamond|prestige|basic|reporter|d[eé]plac|replanif|email|mail|cr[eé]neau|s[eé]ance|shooting|pack|oui|non|merci|cette|cet|ce|ces|mon|ma|mes|offre|fille|fils|enfant|votre|vos|vous|notre|pour|avec|dans|de|du|des|la|le|les|mere|m[eè]re|pere|p[eè]re|maman|papa)\\b/i.test(t)) {\n    return \"\";\n  }\n  if (!/^[A-Za-zÀ-ÿ\\u0600-\\u06FF][A-Za-zÀ-ÿ\\u0600-\\u06FF'’\\- ]{1,39}$/.test(t)) return \"\";\n  return t;\n}\n\nfunction mapPrestation(raw) {\n  const p = String(raw || \"\").toLowerCase().trim();\n  const allowed = [\n    \"grossesse\", \"newborn\", \"cake_smash\", \"birthday\",\n    \"famille\", \"couple\", \"solo\", \"sitter\", \"autre\",\n  ];\n  if (allowed.includes(p)) return p;\n  if (/first.?year|1ere|premi/.test(p)) return \"birthday\";\n  if (/smash/.test(p)) return \"cake_smash\";\n  if (/new.?born|nouveau/.test(p)) return \"newborn\";\n  if (/gross/.test(p)) return \"grossesse\";\n  if (/famil/.test(p)) return \"famille\";\n  if (/coupl/.test(p)) return \"couple\";\n  if (/solo|portrait/.test(p)) return \"solo\";\n  if (/sitter/.test(p)) return \"sitter\";\n  if (/birth|anniv/.test(p)) return \"birthday\";\n  // Airtable Séances.prestation has no \"autre\" option — omit via empty\n  return \"\";\n}\n\nfunction mapPack(raw) {\n  const p = String(raw || \"\").toLowerCase().trim();\n  if (!p) return \"\";\n  if ([\"basic\", \"prestige\", \"vip\", \"diamond\", \"mini\"].includes(p)) return p;\n  if (/diamond/.test(p)) return \"diamond\";\n  if (/\\bvip\\b/.test(p)) return \"vip\";\n  if (/prestige/.test(p)) return \"prestige\";\n  if (/basic|basique/.test(p)) return \"basic\";\n  if (/\\bmini\\b/.test(p)) return \"mini\";\n  return \"\";\n}\n\nfunction collectEnfantNames(payload) {\n  const out = [];\n  const seen = new Set();\n  const parentName = cleanPersonName(payload.prenom || payload.clientName || \"\").toLowerCase();\n  function push(n) {\n    const c = cleanPersonName(n);\n    if (!c) return;\n    const key = c.toLowerCase();\n    // Never store parent as enfant\n    if (parentName && key === parentName) return;\n    if (seen.has(key)) return;\n    seen.add(key);\n    out.push(c);\n  }\n  if (Array.isArray(payload.enfants)) {\n    for (const e of payload.enfants) {\n      if (typeof e === \"string\") push(e);\n      else if (e && e.prenom) push(e.prenom);\n    }\n  }\n  if (Array.isArray(payload.enfant_prenoms)) {\n    for (const e of payload.enfant_prenoms) push(e);\n  }\n  const single = payload.enfant_prenom || payload.childName || payload.prenom_enfant;\n  if (single) {\n    String(single)\n      .split(/\\s*(?:,|;|\\/|\\bet\\b|\\band\\b|\\+|&)\\s*/i)\n      .forEach(push);\n  }\n  return out;\n}\n\nfunction collectEnfantsDetailed(payload) {\n  const parentName = cleanPersonName(payload.prenom || payload.clientName || \"\").toLowerCase();\n  const names = collectEnfantNames(payload);\n  const detailed = [];\n  if (Array.isArray(payload.enfants) && payload.enfants.length && typeof payload.enfants[0] === \"object\") {\n    for (const e of payload.enfants) {\n      const prenom = cleanPersonName(e && e.prenom);\n      if (!prenom) continue;\n      if (parentName && prenom.toLowerCase() === parentName) continue;\n      const dob = s(e.date_naissance || e.dob || \"\").trim();\n      detailed.push({\n        prenom,\n        date_naissance: /^\\d{4}-\\d{2}-\\d{2}/.test(dob) ? dob.slice(0, 10) : \"\",\n        remarques: s(e.remarques || e.notes || \"\", 1000),\n      });\n    }\n  }\n  if (detailed.length) return detailed;\n  const dobsRaw = Array.isArray(payload.enfant_dobs) ? payload.enfant_dobs : [];\n  const singleDob = s(payload.date_naissance || payload.childDob || payload.enfant_date_naissance).trim();\n  const iso = /^\\d{4}-\\d{2}-\\d{2}/.test(singleDob) ? singleDob.slice(0, 10) : \"\";\n  const sharedRem = s(payload.enfant_remarques || \"\", 1000);\n  return names.map((n, i) => {\n    const d = s(dobsRaw[i] || \"\").trim();\n    const dob = /^\\d{4}-\\d{2}-\\d{2}/.test(d) ? d.slice(0, 10) : (names.length === 1 ? iso : (i === 0 ? iso : \"\"));\n    return { prenom: n, date_naissance: dob, remarques: sharedRem };\n  });\n}\n\nfunction fmtSeanceLine(fields) {\n  const f = fields || {};\n  const when = String(f.scheduled_at || \"\").replace(\"T\", \" \").slice(0, 16);\n  const prest = f.prestation || \"séance\";\n  const pack = f.pack ? (\" \" + String(f.pack).toUpperCase()) : \"\";\n  const link = f.lien_reservation || \"\";\n  return { dateLine: (when || \"?\") + \" — \" + prest + pack, linkLine: link || \"\" };\n}\n\nasync function airtable(method, table, qs, body) {\n  const opts = {\n    method,\n    url: `https://api.airtable.com/v0/${BASE}/${encodeURIComponent(table)}`,\n    headers: {\n      Authorization: \"Bearer \" + TOKEN,\n      \"Content-Type\": \"application/json\",\n    },\n    json: true,\n    timeout: 30000,\n  };\n  if (qs) opts.qs = qs;\n  if (body) opts.body = body;\n  return await this.helpers.httpRequest(opts);\n}\n\nasync function upsertByMerge(table, mergeField, fields) {\n  const clean = { ...fields };\n  for (const k of Object.keys(clean)) {\n    if (clean[k] === \"\" || clean[k] === undefined || clean[k] === null) delete clean[k];\n  }\n  if (!clean[mergeField]) {\n    throw new Error(\"missing_merge_\" + mergeField);\n  }\n  const res = await airtable.call(this, \"PATCH\", table, null, {\n    performUpsert: { fieldsToMergeOn: [mergeField] },\n    records: [{ fields: clean }],\n    typecast: true,\n  });\n  return (res && res.records && res.records[0]) || null;\n}\n\n/** Find existing Client by ig_user_id and/or sender_id, then PATCH — avoids IG duplicates. */\nasync function findThenUpsertClient(fields, igsid, senderId) {\n  const clean = { ...fields };\n  for (const k of Object.keys(clean)) {\n    if (clean[k] === \"\" || clean[k] === undefined || clean[k] === null) delete clean[k];\n  }\n  const found = [];\n  const seen = new Set();\n  const formulas = [];\n  if (igsid) {\n    formulas.push(`OR({ig_user_id}='${escFormula(igsid)}',{sender_id}='${escFormula(igsid)}')`);\n  }\n  if (senderId && senderId !== igsid) {\n    formulas.push(`{sender_id}='${escFormula(senderId)}'`);\n  }\n  for (const fml of formulas) {\n    const res = await airtable.call(this, \"GET\", T_CLIENTS, { filterByFormula: fml, maxRecords: 5 });\n    for (const r of (res && res.records) || []) {\n      if (seen.has(r.id)) continue;\n      seen.add(r.id);\n      found.push(r);\n    }\n  }\n  found.sort((a, b) => {\n    const ag = (a.fields && a.fields.ig_user_id) ? 1 : 0;\n    const bg = (b.fields && b.fields.ig_user_id) ? 1 : 0;\n    return bg - ag;\n  });\n  const primary = found[0] || null;\n  if (primary) {\n    // Preserve username sender_id / instagram handle — never replace with numeric IGSID\n    const exSid = s(primary.fields && primary.fields.sender_id).replace(/^@/, \"\").trim();\n    const exIg = s(primary.fields && primary.fields.instagram).replace(/^@/, \"\").trim();\n    const isUser = (u) => !!(u && !/^\\d{5,}$/.test(u));\n    if (!isUser(clean.sender_id) && isUser(exSid)) clean.sender_id = exSid;\n    if (!isUser(clean.instagram) && isUser(exIg || exSid)) clean.instagram = exIg || exSid;\n    if (igsid) clean.ig_user_id = igsid;\n  }\n  if (primary) {\n    const res = await airtable.call(this, \"PATCH\", T_CLIENTS, null, {\n      records: [{ id: primary.id, fields: clean }],\n      typecast: true,\n    });\n    // Drop orphan duplicates for same IG person\n    if (igsid && found.length > 1) {\n      for (const r of found.slice(1)) {\n        const sid = String((r.fields && r.fields.sender_id) || \"\");\n        const ig = String((r.fields && r.fields.ig_user_id) || \"\");\n        if (sid === igsid || ig === igsid || (senderId && sid === senderId)) {\n          try {\n            await airtable.call(this, \"DELETE\", T_CLIENTS + \"/\" + r.id);\n          } catch (e) {\n            try {\n              await this.helpers.httpRequest({\n                method: \"DELETE\",\n                url: `https://api.airtable.com/v0/${BASE}/${encodeURIComponent(T_CLIENTS)}/${r.id}`,\n                headers: { Authorization: \"Bearer \" + TOKEN },\n                json: true,\n                timeout: 15000,\n              });\n            } catch (e2) {}\n          }\n        }\n      }\n    }\n    return (res && res.records && res.records[0]) || primary;\n  }\n  const res = await airtable.call(this, \"POST\", T_CLIENTS, null, {\n    records: [{ fields: clean }],\n    typecast: true,\n  });\n  return (res && res.records && res.records[0]) || null;\n}\n\nconst sender = s(j.at_sender_id || j.instagramUsername || j.senderId || \"\").trim();\nconst out = {\n  ...j,\n  crmSyncOk: false,\n  crmClientId: \"\",\n  crmSeanceId: \"\",\n  crmEnfantId: \"\",\n  crmEnfantIds: [],\n  crmSyncError: \"\",\n};\n\nif (!sender) {\n  out.crmSyncError = \"missing_sender_id\";\n  return [{ json: out }];\n}\n\nconst nowIso = new Date().toISOString();\nconst channelRaw = String(j.channel || \"\").toLowerCase();\nconst explicitIg = s(j.igUserId || j.at_ig_user_id || j.ig_user_id).trim();\nconst hasExplicitIg = /^\\d{5,}$/.test(explicitIg);\n// Stable Instagram scoped id (numeric). Username alone is not enough to identify the person.\nconst igsid = (() => {\n  if (hasExplicitIg) return explicitIg;\n  if (channelRaw !== \"instagram\") return \"\";\n  for (const c of [j.senderId, j.at_sender_id, sender]) {\n    const t = s(c).trim();\n    if (/^\\d{5,}$/.test(t)) return t;\n  }\n  return \"\";\n})();\nconst isIg = channelRaw === \"instagram\" || hasExplicitIg;\nconst channel = isIg ? \"instagram\" : \"whatsapp\";\nconst safePrenom = cleanPersonName(j.prenom || j.clientName || \"\");\nconst igUsername = s(\n  j.instagramUsername || (isIg && !/^\\d{5,}$/.test(sender) ? sender : \"\")\n).replace(/^@/, \"\").trim();\n\ntry {\n  // --- 1) Clients (foyer) ---\n  const clientFields = {\n    // Instagram: username only in sender_id (never numeric IGSID)\n    sender_id: isIg\n      ? (igUsername || (!/^\\d{5,}$/.test(sender) ? sender : \"\"))\n      : sender,\n    telephone: isIg ? \"\" : sender,\n    email: s(j.at_client_email || j.client_email || j.email, 200),\n    channel,\n    ville: s(j.ville || \"YOUR_BUSINESS_CITY\", 80),\n    langue: sanitizeLangue(j.at_langue || j.langue),\n    status: j.status === \"STOP\" ? \"STOP\" : \"ACTIVE\",\n    mis_a_jour: s(j.at_mis_a_jour || j.crmUpdatedAt || nowIso),\n  };\n  if (isIg) {\n    if (igsid) clientFields.ig_user_id = igsid;\n    if (igUsername) {\n      clientFields.instagram = igUsername;\n      clientFields.sender_id = igUsername;\n    }\n  } else if (j.instagramUsername) {\n    clientFields.instagram = s(j.instagramUsername, 120);\n  }\n  // nom_foyer = prénom + numéro (WA) ou prénom + @username (IG)\n  const idPart = isIg\n    ? (igUsername || (!/^\\d{5,}$/.test(String(clientFields.sender_id || sender)) ? String(clientFields.sender_id || sender) : \"\"))\n    : (s(j.telephone || clientFields.telephone || sender).replace(/\\D/g, \"\") || String(sender || \"\"));\n  if (safePrenom) {\n    clientFields.prenom = safePrenom;\n    clientFields.nom_foyer = idPart\n      ? (safePrenom + \" \" + (isIg ? (\"@\" + idPart.replace(/^@/, \"\")) : idPart)).slice(0, 80)\n      : safePrenom;\n  } else {\n    clientFields.nom_foyer = isIg\n      ? (\"@\" + (igUsername || (!/^\\d{5,}$/.test(String(sender)) ? sender : \"instagram\")).replace(/^@/, \"\")).slice(0, 40)\n      : (\"Client \" + String(idPart || sender).slice(-10));\n  }\n\n  // Notes client (thème / remarques / préférences mentionnés)\n  const incomingNotes = s(j.notes || j.bookingNotes || j.client_notes, 2000);\n  const theme = s(j.theme || j.seance_theme, 120);\n  if (incomingNotes || theme) {\n    const noteBits = [];\n    if (theme) noteBits.push(\"Thème: \" + theme);\n    if (incomingNotes) noteBits.push(incomingNotes);\n    clientFields.notes = noteBits.join(\" · \").slice(0, 2000);\n  }\n\n  // Instagram: find by ig_user_id OR sender_id(=igsid) then PATCH — no duplicate rows.\n  // WhatsApp: merge on sender_id (phone).\n  let clientRec;\n  if (isIg) {\n    if (igsid) clientFields.ig_user_id = igsid;\n    clientRec = await findThenUpsertClient.call(\n      this,\n      clientFields,\n      igsid,\n      clientFields.sender_id || sender\n    );\n  } else {\n    clientRec = await upsertByMerge.call(this, T_CLIENTS, \"sender_id\", clientFields);\n  }\n  const clientId = (clientRec && clientRec.id) || \"\";\n  out.crmClientId = clientId;\n\n  // --- 2) Séances (si RDV) ---\n  const cancelled = j.annule === true || j.annule === \"true\" || String(j.annule) === \"true\";\n  const cancelUid = s(\n    j.cancelled_appointment_id\n    || (cancelled ? (j.bookingUid || j.appointment_id || (j.deleteResult && j.deleteResult.bookingUid)) : \"\")\n  ).trim();\n  const appointmentId = s(j.appointment_id || cancelUid).trim();\n  const previousAppt = s(\n    j.previous_appointment_id\n    || (j.updateResult && j.updateResult.rescheduledFromUid)\n    || \"\"\n  ).trim();\n  // Live tool results only — sticky bookingCreated/reporte must NOT re-upsert every later turn\n  // (otherwise a 2nd-RDV chat overwrites the 1st Séances row with the new prestation).\n  const updatedNow = !!(\n    (j.updateResult && j.updateResult.ok)\n    || j.bookingUpdated === true\n    || j.bookingUpdated === \"true\"\n  );\n  const createdNow = !!(j.bookingResult && j.bookingResult.ok);\n  const bookedNow = !!(createdNow || updatedNow);\n  // Sticky flags: bootstrap missing Séances row only (never overwrite existing)\n  const stickyCreated = !!(\n    j.bookingCreated === true\n    || j.bookingCreated === \"true\"\n  );\n  const hasBookingLink = !!(\n    s(j.lien_reservation || j.calBookingLink || j.booking_link).match(/cal\\.com\\/booking\\//i)\n  );\n  // IMPORTANT: do NOT re-sync on every turn just because scheduled_at exists.\n  const richPatch = !!(theme || incomingNotes);\n  // Bootstrap: if we have a Cal uid (+ usually a link) ensure a Séances row exists\n  const shouldSyncSeance = !!appointmentId && (\n    bookedNow || cancelled || !!cancelUid || richPatch || hasBookingLink\n  );\n\n  async function findSeanceByAppt(appt) {\n    const id = s(appt).trim();\n    if (!id) return null;\n    try {\n      const found = await airtable.call(this, \"GET\", T_SEANCES, {\n        filterByFormula: `{appointment_id} = '${escFormula(id)}'`,\n        maxRecords: 1,\n      });\n      return ((found && found.records) || [])[0] || null;\n    } catch (eFind) {\n      return null;\n    }\n  }\n\n  async function patchSeanceRecord(recId, fields) {\n    const clean = { ...fields };\n    for (const k of Object.keys(clean)) {\n      if (clean[k] === \"\" || clean[k] === undefined || clean[k] === null) delete clean[k];\n    }\n    const upd = await airtable.call(this, \"PATCH\", T_SEANCES, null, {\n      records: [{ id: recId, fields: clean }],\n      typecast: true,\n    });\n    return (upd && upd.records && upd.records[0]) || null;\n  }\n\n  async function refreshClientSeanceStats(cid) {\n    if (!cid) return;\n    try {\n      const listed = await airtable.call(this, \"GET\", T_SEANCES, {\n        filterByFormula: \"{statut} = 'booked'\",\n        maxRecords: 100,\n      });\n      const recs = ((listed && listed.records) || []).filter((r) => {\n        const links = (r.fields && r.fields.client) || [];\n        return Array.isArray(links) && links.includes(cid);\n      });\n      // sort by scheduled_at\n      recs.sort((a, b) => String((a.fields || {}).scheduled_at || \"\").localeCompare(String((b.fields || {}).scheduled_at || \"\")));\n      const years = [];\n      const dateLines = [];\n      const linkLines = [];\n      for (const r of recs) {\n        const f = r.fields || {};\n        const y = Number(f.annee || 0);\n        if (y) years.push(y);\n        const line = fmtSeanceLine(f);\n        if (line.dateLine) dateLines.push(line.dateLine);\n        if (line.linkLine) linkLines.push(line.linkLine);\n      }\n      const patch = {\n        nombre_seances: recs.length,\n        dates_reservations: dateLines.join(\"\\n\"),\n        liens_reservations: linkLines.join(\"\\n\"),\n        mis_a_jour: nowIso,\n      };\n      if (years.length) {\n        patch.premiere_annee = Math.min(...years);\n        patch.derniere_annee = Math.max(...years);\n      } else {\n        patch.premiere_annee = null;\n        patch.derniere_annee = null;\n      }\n      await airtable.call(this, \"PATCH\", T_CLIENTS, null, {\n        records: [{ id: cid, fields: patch }],\n        typecast: true,\n      });\n    } catch (eCount) {\n      // non-bloquant\n    }\n  }\n\n  // --- 3) Enfants — sync exact list from bot memory (create/update + delete orphans)\n  const enfantsDetailed = collectEnfantsDetailed(j);\n  const enfantIds = [];\n  const deletedEnfantIds = [];\n  const skipEnfantCreate = !!(updatedNow || cancelled) && !createdNow;\n  const desiredNames = new Set(\n    enfantsDetailed.map((c) => String(c.prenom || \"\").toLowerCase()).filter(Boolean)\n  );\n  // Always reconcile when we have a client: memory is source of truth for child list.\n  // (Empty desiredNames after a correction must delete leftover Airtable rows like \"Ww\".)\n  const shouldReconcileEnfants = !!clientId && (\n    Array.isArray(j.enfants)\n    || Array.isArray(j.enfant_prenoms)\n    || j.enfantsCorrected === true\n    || enfantsDetailed.length > 0\n  );\n\n  if (clientId && shouldReconcileEnfants) {\n    let existingForClient = [];\n    try {\n      // List + filter in JS (Airtable linked-record formulas are unreliable across bases)\n      const foundAll = await airtable.call(this, \"GET\", T_ENFANTS, {\n        maxRecords: 100,\n      });\n      existingForClient = ((foundAll && foundAll.records) || []).filter((r) => {\n        const links = (r.fields && r.fields.client) || [];\n        return Array.isArray(links) && links.includes(clientId);\n      });\n    } catch (eList) {\n      existingForClient = [];\n    }\n\n    // Delete orphans not in desired list\n    for (const rec of existingForClient) {\n      const name = String((rec.fields && rec.fields.prenom) || \"\").trim();\n      if (!name) continue;\n      if (!desiredNames.has(name.toLowerCase())) {\n        try {\n          await this.helpers.httpRequest({\n            method: \"DELETE\",\n            url: `https://api.airtable.com/v0/${BASE}/${encodeURIComponent(T_ENFANTS)}/${rec.id}`,\n            headers: { Authorization: \"Bearer \" + TOKEN },\n            json: true,\n            timeout: 15000,\n          });\n          deletedEnfantIds.push(rec.id);\n        } catch (eDel) {\n          out.crmEnfantDeleteError = String(eDel.message || eDel).slice(0, 200);\n        }\n      }\n    }\n\n    for (const child of enfantsDetailed) {\n      const childName = child.prenom;\n      let enfant = existingForClient.find((r) => {\n        const n = String((r.fields && r.fields.prenom) || \"\").toLowerCase();\n        return n === String(childName).toLowerCase() && !deletedEnfantIds.includes(r.id);\n      }) || null;\n      if (!enfant) {\n        try {\n          const found = await airtable.call(this, \"GET\", T_ENFANTS, {\n            filterByFormula: `{prenom} = '${escFormula(childName)}'`,\n            maxRecords: 20,\n          });\n          const list = (found && found.records) || [];\n          enfant = list.find((r) => {\n            const links = (r.fields && r.fields.client) || [];\n            return Array.isArray(links) && links.includes(clientId);\n          }) || null;\n        } catch (eFind) {\n          enfant = null;\n        }\n      }\n      const enfantFields = {\n        prenom: childName,\n        client: [clientId],\n      };\n      const childRem = s(child.remarques || j.enfant_remarques, 1000);\n      if (childRem) enfantFields.remarques = childRem;\n      if (child.date_naissance) {\n        enfantFields.date_naissance = child.date_naissance;\n      }\n      if (enfant && enfant.id && !deletedEnfantIds.includes(enfant.id)) {\n        const upd = await airtable.call(this, \"PATCH\", T_ENFANTS, null, {\n          records: [{ id: enfant.id, fields: enfantFields }],\n          typecast: true,\n        });\n        enfantIds.push((upd && upd.records && upd.records[0] && upd.records[0].id) || enfant.id);\n      } else if (!skipEnfantCreate) {\n        const created = await airtable.call(this, \"POST\", T_ENFANTS, null, {\n          records: [{ fields: enfantFields }],\n          typecast: true,\n        });\n        const id = (created && created.records && created.records[0] && created.records[0].id) || \"\";\n        if (id) enfantIds.push(id);\n      } else if (enfant && enfant.id) {\n        enfantIds.push(enfant.id);\n      }\n    }\n  }\n  out.crmEnfantIds = enfantIds;\n  out.crmEnfantId = enfantIds[0] || \"\";\n  out.crmEnfantsDeleted = deletedEnfantIds;\n\n  if (shouldSyncSeance) {\n    const prestation = mapPrestation(j.prestation);\n    const pack = mapPack(\n      j.packName || j.pack || j.selectedPack || j.calPack || j.lastPackName\n      || (j.myBookings && j.myBookings[0] && j.myBookings[0].packName)\n    );\n    const scheduled = s(j.at_scheduled_at || j.scheduled_at);\n    let year = 0;\n    if (scheduled) {\n      const d = new Date(scheduled);\n      if (!Number.isNaN(d.getTime())) year = d.getFullYear();\n    }\n    if (!year) year = new Date().getFullYear();\n\n    const titreParts = [\n      prestation || \"séance\",\n      pack ? pack.toUpperCase() : \"\",\n      scheduled ? scheduled.slice(0, 10) : \"\",\n    ].filter(Boolean);\n\n    const isCancelTarget = !!(cancelled || (cancelUid && cancelUid === appointmentId));\n    let statut = isCancelTarget ? \"cancelled\" : \"booked\";\n\n    const seanceFields = {\n      appointment_id: appointmentId,\n      titre: s(titreParts.join(\" — \"), 200),\n      annee: year,\n      ville: s(j.ville || \"YOUR_BUSINESS_CITY\", 80),\n      scheduled_at: scheduled || undefined,\n      lien_reservation: s(j.lien_reservation || j.calBookingLink || j.booking_link, 500),\n      statut,\n      source: \"bot\",\n      mis_a_jour: nowIso,\n      remarque: s(j.bookingNotes || j.notes || incomingNotes, 2000),\n      theme: theme || undefined,\n    };\n    if (prestation) seanceFields.prestation = prestation;\n    if (pack) seanceFields.pack = pack;\n    if (clientId) seanceFields.client = [clientId];\n    if (enfantIds.length) seanceFields.enfant = enfantIds;\n\n    // REPORT: Cal.com change souvent l'uid → modifier LA MÊME ligne Séances (pas créer + cancel)\n    const isReschedule = !!(\n      updatedNow\n      && previousAppt\n      && appointmentId\n      && previousAppt !== appointmentId\n      && !isCancelTarget\n    );\n\n    if (isReschedule) {\n      const oldRec = await findSeanceByAppt.call(this, previousAppt);\n      if (oldRec && oldRec.id) {\n        const seanceRec = await patchSeanceRecord.call(this, oldRec.id, seanceFields);\n        out.crmSeanceId = (seanceRec && seanceRec.id) || oldRec.id;\n        out.crmSeanceUpdatedInPlace = true;\n        out.crmSeancePreviousAppt = previousAppt;\n      } else {\n        // Pas de ligne ancienne trouvée → upsert sur le nouvel uid (1 seule ligne)\n        const seanceRec = await upsertByMerge.call(this, T_SEANCES, \"appointment_id\", seanceFields);\n        out.crmSeanceId = (seanceRec && seanceRec.id) || \"\";\n      }\n    } else if (richPatch && !bookedNow && !isCancelTarget) {\n      const light = {\n        appointment_id: appointmentId,\n        mis_a_jour: nowIso,\n        source: \"bot\",\n      };\n      if (theme) light.theme = theme;\n      if (incomingNotes || j.bookingNotes || j.notes) {\n        light.remarque = s(j.bookingNotes || j.notes || incomingNotes, 2000);\n      }\n      if (clientId) light.client = [clientId];\n      if (enfantIds.length) light.enfant = enfantIds;\n      const seanceRec = await upsertByMerge.call(this, T_SEANCES, \"appointment_id\", light);\n      out.crmSeanceId = (seanceRec && seanceRec.id) || \"\";\n    } else if (bookedNow || isCancelTarget) {\n      // Create OR cancel: upsert même appointment_id (1 ligne)\n      const seanceRec = await upsertByMerge.call(this, T_SEANCES, \"appointment_id\", seanceFields);\n      out.crmSeanceId = (seanceRec && seanceRec.id) || \"\";\n    } else {\n      // Sticky bookingCreated / hasBookingLink: bootstrap ONLY if row missing.\n      // Never overwrite an existing Séances row from chat drift (2e RDV / autre presta).\n      const existing = await findSeanceByAppt.call(this, appointmentId);\n      if (existing && existing.id) {\n        out.crmSeanceId = existing.id;\n        out.crmSeanceSkippedDrift = true;\n      } else if (stickyCreated || hasBookingLink) {\n        const seanceRec = await upsertByMerge.call(this, T_SEANCES, \"appointment_id\", seanceFields);\n        out.crmSeanceId = (seanceRec && seanceRec.id) || \"\";\n        out.crmSeanceBootstrapped = true;\n      }\n    }\n\n    await refreshClientSeanceStats.call(this, clientId);\n  } else if (clientId && (enfantIds.length || bookedNow)) {\n    await refreshClientSeanceStats.call(this, clientId);\n  }\n\n  out.crmSyncOk = true;\n  out.crmSyncError = \"\";\n} catch (e) {\n  const msg = String((e && e.message) || e).slice(0, 500);\n  out.crmSyncOk = false;\n  out.crmSyncError = msg;\n  if (/INVALID_PERMISSIONS|NOT_FOUND|403|404/i.test(msg)) {\n    out.crmSyncError = \"crm_tables_missing_or_forbidden: \" + msg.slice(0, 200);\n  }\n}\n\nreturn [{ json: out }];\n"
+      },
+      "id": "ea88cb5a-4e5b-4a0d-9ce2-3b8910eecfa0",
+      "name": "CRM Sync Relational",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6608,
+        320
+      ],
+      "continueOnFail": true,
+      "notes": "CRM Clients/Enfants/Séances — count/find via rec ids (pas ARRAYJOIN)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// BUYER SETUP: customize the business profile and conversation rules in this node.\nconst j = $input.first().json || {};\nconst messageText = String(j.messageText || j.transcription || j.message || j.text || '').trim();\nconst sessionId = String(j.igUserId || j.senderId || j.from || ('test-' + Date.now()));\nconst store = $getWorkflowStaticData('global');\nif (!store.clients) store.clients = {};\nconst previous = store.clients[sessionId] || {};\nconst history = String(previous.conversationFull || previous.history || j.historique || '').slice(-2500);\nconst language = String(j.langue || previous.langue || 'EN').trim() || 'EN';\n\nconst businessProfile = `\nYou are YOUR_ASSISTANT_NAME, the helpful booking assistant for YOUR_BUSINESS_NAME in YOUR_BUSINESS_CITY.\nReply in ${language}. Keep replies concise, warm and professional.\nUse the catalog tool before giving prices or inclusions.\nUse Get_slots before claiming a time is available.\nOnly create a booking after you have the customer's name, email and a confirmed available time.\nUse Save_CRM whenever you learn a customer fact.\nUse Escalate for complaints, refunds, sensitive cases or a request for a human.\nBusiness description, services, policies, address and tone must be replaced by the buyer before activation.\n`.trim();\n\nreturn [{ json: {\n  ...j,\n  messageText,\n  sessionId,\n  langue: language,\n  history,\n  conversationContext: history ? `[Conversation history]\\n${history}\\n[New message]\\n${messageText}` : messageText,\n  systemPrompt: businessProfile,\n  prenom: j.prenom || previous.prenom || '',\n  prestation: j.prestation || previous.prestation || '',\n  packName: j.packName || j.pack || previous.packName || '',\n  clientEmail: j.clientEmail || previous.clientEmail || '',\n} }];\n"
+      },
+      "id": "e8ec906c-b595-4cdf-a428-f75583b3f16e",
+      "name": "Prep Agent Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3584,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}",
+        "options": {
+          "systemMessage": "=# RÔLE\nTu es YOUR_ASSISTANT_NAME, YOUR_BUSINESS_NAME (studio photo YOUR_BUSINESS_CITY — YOUR_BUSINESS_LOCATION). WhatsApp naturel, 1re personne, 2–5 phrases, 1 emoji max (🤍).\nMaintenant : {{ $now.toFormat('dd/LL/yyyy HH:mm') }} (Africa/Casablanca).\n\n# RÈGLE D’OR (non négociable)\nLe client a DÉJÀ dit ce qu’il veut → RÉPONDS DIRECTEMENT avec le contenu.\nInterdit de renvoyer un menu (« packs, prix, déroulé… que voulez-vous savoir ? ») si la demande est claire.\nEx. « dis-moi les offres / packs » → liste tout de suite les séances + aperçu packs/prix. Ensuite UNE question utile max (quelle séance approfondir).\n\n# HORAIRES\nFrançais naturel seulement pour les créneaux (« mardi 3 août à 12h »), même si le client parle anglais.\n\n# LANGUE (non négociable)\nRéponds TOUJOURS dans la langue du DERNIER message client (FR / EN / darija / AR).\nIgnore l’historique pour la langue : message EN → réponse EN ; message FR → réponse FR.\nSi [LANGUE] est donné, suis-le. Pas de confirmation (« on continue en anglais ? ») — bascule directe.\n\n# RÉPONSE COMPLÈTE (non négociable)\nToujours terminer ta réponse dans CE message (phrase complète, point final). Interdit de couper au milieu ou de dire « je continue… ». 2–6 phrases max, une idée claire.\n\n# INTENTIONS\n1) INFO (offres, packs, prix, déroulé, studio, livraison, retouche…) → répondre avec les faits / Get_catalogue. Pas de date.\n2) RÉSA (jour/heure, prénom+email) → [CRENEAUX] + booking si [BOOKING_RESULT] ok.\n3) CORRECTION / PLAINTE → traiter / Escalate.\nSi [PACK CLIENT] ou [PACK] est présent → répondre pour CE pack sans redemander.\n# STUDIO\nYOUR_BUSINESS_NAME, YOUR_BUSINESS_LOCATION — YOUR_BUSINESS_CITY. Adresse Maps : YOUR_GOOGLE_MAPS_URL · Contact YOUR_BUSINESS_PHONE.\nPaiement : dû à l’arrivée au studio. Détails de livraison photos : envoyés par e-mail après la séance.\nSi le client veut voir le calendrier lui-même → donne le lien Cal.com (sans bloquer).\nAprès réservation ou report réussi → donne TOUJOURS le lien https://cal.com/booking/… de la réservation.\n\n# FAITS\n[CRENEAUX] [OFFRES] [FAITS PACK] [EXTRAS] [AGES] [ADRESSE] [PAIEMENT] [LIVRAISON] [CAL_LIEN] [LIEN_RESERVATION] [BOOKING_RESULT] [UPDATE_RESULT] [DELETE_RESULT] [JOUR DEMANDE] [ENFANTS] [THEME] [NOTES]\n\n# EXTRAS (catalogue officiel — ne jamais inventer le contraire)\nOui, des extras existent selon la séance : personne en plus (YOUR_PRICE), tirage 15/21 (+30 dh, First Year +50), maquillage/coiffure (YOUR_PRICE), shoot à domicile (YOUR_PRICE, First Year +2000).\nSi on demande « à domicile / chez moi » → OUI en extra. Ne jamais dire que ce n’est pas proposé.\n\n# FAQ ACCUEILLANTES (pas d’escalade)\nParking / se garer → OUI, places autour de YOUR_BUSINESS_LOCATION. Langue EN → OUI, séance FR ou EN. Chien / animal → OUI, bienvenus.\nPolitique d’annulation / report (question d’info) → expliquer les règles (annulation gratuite jusqu’à 48h avant ; report possible jusqu’à 24h avant). Ce n’est PAS une demande d’annuler/reporter LE RDV du client.\nJamais « je transmets à l’équipe » pour ces questions. Escalade UNIQUEMENT plainte / demande humain explicite.\n\n# SÉANCES ENFANTS (newborn, cake smash, birthday, sitter, famille)\nPour ces séances, le prénom ET la date de naissance (jj/mm/aaaa) de chaque enfant sont ESSENTIELS pour le dossier Airtable.\nAprès la résa (ou dès que c’est naturel) : demande d’abord le(s) prénom(s), puis la/les date(s) de naissance — jusqu’à les avoir. Ne bloque pas Create_booking, mais ne considère PAS le dossier enfant comme complet sans les deux.\nLe prénom + email pour Cal.com = PARENT (client), JAMAIS un enfant.\nThème / décor / remarques / allergies / préférences → note et confirme brièvement.\n\n# OUTILS\nGet_catalogue · Get_slots · Create_booking · Update_booking · Delete_booking · Save_CRM · Escalate\nSi [BOOKING_RESULT] ok est déjà présent → NE PAS rappeler Create_booking (déjà réservé). Confirme + donne le lien.\nSi [EMAIL] + créneau déjà connus dans le contexte et pas encore de BOOKING_RESULT → tu peux Create_booking UNE fois (prénom parent + vrai email).\n\n# REPORT / REPLANIFICATION (non négociable)\nSi le client a DÉJÀ une réservation ([LIEN_RESERVATION] / bookingUid / « ma réservation ») et veut changer jour/heure → Update_booking UNIQUEMENT.\nInterdit de Create_booking pour un report (ça créerait un doublon). Passer bookingUid existant + nouveau start ISO de Get_slots.\nMots déclencheurs : reporter, replanifier, décaler, changer l’horaire, plutôt le…, autre créneau.\nSi AUCUNE réservation sur CETTE conversation → ne pas inventer un report/annulation : demander de réserver ou le lien/email du RDV.\nSi le client donne l’uid/lien d’un AUTRE client → REFUSER (sécurité). Ne jamais Update/Delete un booking qui n’appartient pas à cette conversation.\n\n# CRM / AIRTABLE (non négociable — TOI tu écris les champs via Save_CRM)\nTu es la SEULE source de vérité pour Airtable (Clients / Enfants / Séances / Leads via sync).\nDès que tu COMPRENDS un fait client (même avec fautes : « s appelle max », « imne », « vippp »), appelle Save_CRM avec l’orthographe corrigée.\nPass JSON (sessionId = valeur de [SESSION]) :\n{\"sessionId\":\"…\",\"prenom\":\"Imane\",\"email\":\"…\",\"enfants\":[\"Amine\"],\"date_naissance\":\"12/03/2024\",\"prestation\":\"cake_smash\",\"pack\":\"vip\",\"notes\":\"allergie gluten\",\"theme\":\"licorne\"}\n- prenom = PARENT (cliente), jamais l’enfant\n- enfants = liste COMPLÈTE des vrais prénoms enfants (remplace l’ancienne liste). Jamais de typos/faux noms (« ww », « xx »).\n- Jamais un mot FAQ / question comme enfant : « comment », « quoi », « tarif », « oui »…\n- date_naissance = date enfant (jj/mm/aaaa ou YYYY-MM-DD) quand un seul enfant ; sinon note dans enfants/notes.\n- Si le client nie un enfant (« j’ai pas de fils nommé Ww », « c’est faux ») → Save_CRM avec enfants = uniquement les prénoms restants. Ne dis PAS « corrigé » sans Save_CRM.\n- pack = basic|prestige|vip|diamond|mini\n- prestation = sitter|newborn|cake_smash|famille|couple|solo|grossesse|birthday|first_year\nAppelle Save_CRM à CHAQUE nouveau fait (prénom, enfant, pack, thème, note, email) — pas seulement à la résa.\nNe dis pas au client que tu « sauvegardes ». Le workflow ne devine PAS les prénoms : sans Save_CRM, Airtable reste vide/faux.\n\n# STYLE WHATSAPP (non négociable)\nTexte fluide uniquement. Interdit : tableaux markdown, colonnes avec |, listes à puces (- / •), gras ** **, titres #.\nPour les packs : phrases naturelles (« Basic YOUR_PRICE : … Prestige YOUR_PRICE : … ») séparées par · ou virgules, pas de tableau.\n\n# INTERDIT\nMenu IVR. Reformuler la question du client. Inventer créneau/prix. Dire que le domicile n’existe pas. Pousser une date sur une question d’offre. Demander de « renvoyer dans 20 secondes ». Tableaux / markdown.\n",
+          "maxIterations": 6
+        }
+      },
+      "id": "fd8e5cef-a145-47a2-a726-71ecf333a5a2",
+      "name": "AI Booking Assistant",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        4256,
+        544
+      ],
+      "retryOnFail": true,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-sonnet-4-6",
+          "cachedResultName": "Claude Sonnet 4.6"
+        },
+        "options": {
+          "maxTokensToSample": 1400,
+          "temperature": 0.4,
+          "thinkingMode": "disabled"
+        }
+      },
+      "id": "ba61b3fe-1731-4f4f-adbb-79ad79510fe4",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.5,
+      "position": [
+        3808,
+        768
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "",
+          "name": "Anthropic API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Prep Agent Input').item.json.sessionId }}",
+        "contextWindowLength": 8
+      },
+      "id": "618deab9-3be8-4bdf-b687-7ddb0b6773a5",
+      "name": "Simple Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        3936,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Return YOUR_BUSINESS_NAME catalogue details+prices. Call before citing pack details.",
+        "jsCode": "// BUYER SETUP: Replace every example below with your real services, prices and inclusions.\n// The assistant can call this tool to answer offer and pricing questions.\nconst CATALOG = {\n  service_1: {\n    displayName: 'YOUR SERVICE 1',\n    packs: {\n      standard: { price: 'YOUR_PRICE', include: 'Describe what is included' },\n      premium: { price: 'YOUR_PRICE', include: 'Describe what is included' },\n    },\n    extras: ['Optional extra 1', 'Optional extra 2'],\n  },\n  service_2: {\n    displayName: 'YOUR SERVICE 2',\n    packs: {\n      standard: { price: 'YOUR_PRICE', include: 'Describe what is included' },\n    },\n    extras: [],\n  },\n};\nreturn JSON.stringify({ ok: true, catalog: CATALOG, setupRequired: true });\n"
+      },
+      "id": "c023ccdb-3b35-4db1-a0a5-4a21f17b623b",
+      "name": "Get_catalogue",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4064,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Deprecated — use Get_catalogue then advise packs yourself.",
+        "jsCode": "return JSON.stringify({ ok: true, hint: 'Use Get_catalogue then advise 1–2 packs yourself.' });"
+      },
+      "id": "2f35df1c-1be3-4e6f-ae4c-63c7f135aec8",
+      "name": "Advise_pack",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        -224,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Fetch REAL Cal.com free slots for a day range. JSON: {\"eventTypeSlug\":\"solo-prestige\",\"start\":\"YYYY-MM-DD\",\"end\":\"YYYY-MM-DD\"}. Tell the client times in French only (ex: mardi 3 août à 12h).",
+        "jsCode": "function parseArgs(q) {\n  if (q && typeof q === 'object' && !Array.isArray(q)) return q;\n  const s = String(q || '').trim();\n  if (!s) return {};\n  try { return JSON.parse(s); } catch (e) {}\n  const out = {};\n  const iso = s.match(/\\d{4}-\\d{2}-\\d{2}T[\\d:.+-Z]+/g) || [];\n  const days = s.match(/\\d{4}-\\d{2}-\\d{2}/g) || [];\n  if (iso[0]) out.start = iso[0];\n  if (days[0]) out.startDay = days[0];\n  if (days[1]) out.endDay = days[1];\n  const em = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  if (em) out.email = em[0];\n  const uid = s.match(/bookingUid[\"'\\s:=]+([A-Za-z0-9_-]+)/i) || s.match(/\\buid[\"'\\s:=]+([A-Za-z0-9_-]+)/i);\n  if (uid) out.bookingUid = uid[1];\n  return out;\n}\nfunction ymd(d) {\n  const y = d.getFullYear();\n  const m = String(d.getMonth() + 1).padStart(2, '0');\n  const day = String(d.getDate()).padStart(2, '0');\n  return `${y}-${m}-${day}`;\n}\nfunction mapSlug(raw) {\n  // BUYER SETUP: pass one of the Cal.com slugs configured in Normalize & Filter.\n  return String(raw || 'YOUR_DEFAULT_EVENT_TYPE').toLowerCase().trim().replace(/_/g, '-');\n}\nconst http = helpers.httpRequest.bind(helpers);\nconst HDR_SLOTS = {\n  'cal-api-version': '2024-09-04',\n  Accept: 'application/json',\n  'User-Agent': 'your-businessBot-AgentV8/1.0',\n};\nconst HDR_BOOK = {\n  'Content-Type': 'application/json',\n  Accept: 'application/json',\n  'cal-api-version': '2024-08-13',\n  'User-Agent': 'Mozilla/5.0 (compatible; your-businessBot/1.0; +https://cal.com)',\n  Origin: 'https://cal.com',\n  Referer: 'https://cal.com/',\n};\n\nconst args = parseArgs(query);\nconst slug = mapSlug(args.eventTypeSlug || args.slug || args.prestation || 'solo-prestige');\nconst today = new Date();\nconst start = String(args.start || args.startDay || ymd(today)).slice(0, 10);\nlet end = String(args.end || args.endDay || '').slice(0, 10);\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(end)) {\n  const e = new Date(start + 'T12:00:00');\n  e.setDate(e.getDate() + 14);\n  end = ymd(e);\n}\nconst url = `https://api.cal.com/v2/slots?username=YOUR_BUSINESS_NAME&eventTypeSlug=${encodeURIComponent(slug)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&timeZone=Africa%2FCasablanca`;\nlet body;\ntry {\n  body = await http({ method: 'GET', url, headers: HDR_SLOTS, json: true });\n} catch (err) {\n  return JSON.stringify({ ok: false, error: String(err.message || err), slug, start, end });\n}\nconst data = (body && body.data) ? body.data : body;\nconst slots = [];\nif (data && typeof data === 'object') {\n  for (const [day, vals] of Object.entries(data)) {\n    const arr = Array.isArray(vals) ? vals : (vals && vals.slots) || [];\n    for (const v of arr) {\n      const iso = typeof v === 'string' ? (v.includes('T') ? v : `${day}T${v}`) : (v && (v.time || v.start || v));\n      if (iso) slots.push(String(iso));\n      if (slots.length >= 12) break;\n    }\n    if (slots.length >= 12) break;\n  }\n}\nreturn JSON.stringify({\n  ok: true,\n  eventTypeSlug: slug,\n  start,\n  end,\n  count: slots.length,\n  slots,\n  hint: slots.length ? 'Propose 2–3 créneaux ISO exacts. Ne jamais inventer.' : 'Aucun créneau — demander un autre jour / autre slug.',\n});"
+      },
+      "id": "55929a43-6038-497d-b091-ced544248aea",
+      "name": "Get_slots",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4192,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Create Cal.com booking with name + real email + start from Get_slots. Confirm to the client in French natural time only (ex: mardi 3 août à 12h).",
+        "jsCode": "function parseArgs(q) {\n  if (q && typeof q === 'object' && !Array.isArray(q)) return q;\n  const s = String(q || '').trim();\n  if (!s) return {};\n  try { return JSON.parse(s); } catch (e) {}\n  const out = {};\n  const iso = s.match(/\\d{4}-\\d{2}-\\d{2}T[\\d:.+-Z]+/g) || [];\n  const days = s.match(/\\d{4}-\\d{2}-\\d{2}/g) || [];\n  if (iso[0]) out.start = iso[0];\n  if (days[0]) out.startDay = days[0];\n  if (days[1]) out.endDay = days[1];\n  const em = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  if (em) out.email = em[0];\n  const uid = s.match(/bookingUid[\"'\\s:=]+([A-Za-z0-9_-]+)/i) || s.match(/\\buid[\"'\\s:=]+([A-Za-z0-9_-]+)/i);\n  if (uid) out.bookingUid = uid[1];\n  return out;\n}\nfunction ymd(d) {\n  const y = d.getFullYear();\n  const m = String(d.getMonth() + 1).padStart(2, '0');\n  const day = String(d.getDate()).padStart(2, '0');\n  return `${y}-${m}-${day}`;\n}\nfunction mapSlug(raw) {\n  // BUYER SETUP: pass one of the Cal.com slugs configured in Normalize & Filter.\n  return String(raw || 'YOUR_DEFAULT_EVENT_TYPE').toLowerCase().trim().replace(/_/g, '-');\n}\nconst http = helpers.httpRequest.bind(helpers);\nconst HDR_SLOTS = {\n  'cal-api-version': '2024-09-04',\n  Accept: 'application/json',\n  'User-Agent': 'your-businessBot-AgentV8/1.0',\n};\nconst HDR_BOOK = {\n  'Content-Type': 'application/json',\n  Accept: 'application/json',\n  'cal-api-version': '2024-08-13',\n  'User-Agent': 'Mozilla/5.0 (compatible; your-businessBot/1.0; +https://cal.com)',\n  Origin: 'https://cal.com',\n  Referer: 'https://cal.com/',\n};\n\nconst args = parseArgs(query);\nconst start = String(args.start || args.slot || '').trim();\nconst name = String(args.name || args.clientName || '').trim();\nconst email = String(args.email || args.clientEmail || '').trim();\nconst slug = mapSlug(args.eventTypeSlug || args.slug || 'solo-prestige');\nif (!start || !name || !email) {\n  return JSON.stringify({ ok: false, need: ['start','name','email'], got: { start, name, email } });\n}\nif (/@YOUR_BUSINESS_NAME\\.ma$/i.test(email) || /example\\.com$/i.test(email) || /test@test/i.test(email)) {\n  return JSON.stringify({ ok: false, error: 'email_not_deliverable', hint: 'Demander un vrai email (Gmail/Outlook…)' });\n}\n// Block duplicate Create when a booking already exists for this client (must Update_booking)\nconst forceNew = /^(1|true|yes)$/i.test(String(args.forceNew || args.newBooking || ''));\ntry {\n  const store = $getWorkflowStaticData('global');\n  const clients = (store && store.clients) || {};\n  for (const v of Object.values(clients)) {\n    if (!v) continue;\n    const sameEmail = email && String(v.clientEmail || '').toLowerCase() === email.toLowerCase();\n    const sameName = name && String(v.prenom || '').toLowerCase() === name.toLowerCase();\n    const existingUid = String(v.bookingUid || v.lastBookingUid || '').trim();\n    if (existingUid && !v.annule && (sameEmail || (sameName && v._pendingReschedule))) {\n      if (!forceNew) {\n        return JSON.stringify({\n          ok: false,\n          error: 'already_booked_use_update',\n          bookingUid: existingUid,\n          hint: 'Client a deja une reservation. Appeler Update_booking avec bookingUid + nouveau start. Ne pas Create_booking.',\n        });\n      }\n    }\n  }\n} catch (eBlock) {}\nconst PACK_PRICES = {}; // Buyer defines prices in Get_catalogue, never in booking code.\nfunction slugParts(s) {\n  const x = String(s || '').toLowerCase();\n  let prest = '';\n  let pack = '';\n  if (/sitter/.test(x)) prest = 'sitter';\n  else if (/newborn/.test(x)) prest = 'newborn';\n  else if (/cake/.test(x)) prest = 'cake_smash';\n  else if (/grossesse/.test(x)) prest = 'grossesse';\n  else if (/couple/.test(x)) prest = 'couple';\n  else if (/solo/.test(x)) prest = 'solo';\n  else if (/famille/.test(x)) prest = 'famille';\n  else if (/birthday/.test(x)) prest = 'birthday';\n  if (/\\bvip\\b/.test(x)) pack = 'vip';\n  else if (/prestige/.test(x)) pack = 'prestige';\n  else if (/diamond/.test(x)) pack = 'diamond';\n  else if (/basic/.test(x)) pack = 'basic';\n  else if (/\\bmini\\b/.test(x)) pack = 'mini';\n  return { prest, pack };\n}\nconst sp = slugParts(slug);\nlet storeClient = null;\ntry {\n  const store = $getWorkflowStaticData('global');\n  const clients = (store && store.clients) || {};\n  for (const v of Object.values(clients)) {\n    if (!v) continue;\n    if (email && String(v.clientEmail || '').toLowerCase() === email.toLowerCase()) { storeClient = v; break; }\n  }\n  if (!storeClient) {\n    for (const v of Object.values(clients)) {\n      if (v && String(v.prenom || '').toLowerCase() === String(name || '').toLowerCase() && v.clientEmail) {\n        storeClient = v; break;\n      }\n    }\n  }\n} catch (eStore) {}\nconst prestKey = String((storeClient && (storeClient.prestation || storeClient.lastPrestation)) || sp.prest || '').toLowerCase();\nconst packKey = String((storeClient && (storeClient.packName || storeClient.lastPackName || storeClient.pack)) || sp.pack || '').toLowerCase();\nconst basePrice = (PACK_PRICES[prestKey] && PACK_PRICES[prestKey][packKey]) || 0;\nconst noteBits = ['Booking created by YOUR_BUSINESS_NAME assistant'];\nconst calNotes = String(args.notes || noteBits.join('\\n')).slice(0, 4000);\nconst payload = {\n  eventTypeSlug: slug,\n  username: 'YOUR_BUSINESS_NAME',\n  start,\n  attendee: { name, email, timeZone: 'Africa/Casablanca', language: 'fr' },\n};\nif (calNotes) {\n  payload.bookingFieldsResponses = { notes: calNotes };\n  payload.metadata = {\n    source: 'YOUR_BUSINESS_NAME-bot',\n    prestation: prestKey,\n    pack: packKey,\n    packPriceDh: String(basePrice || ''),\n    orderTotalDh: String(basePrice || ''),\n  };\n}\nlet body;\ntry {\n  body = await http({ method: 'POST', url: 'https://api.cal.com/v2/bookings', headers: HDR_BOOK, body: payload, json: true });\n} catch (err) {\n  return JSON.stringify({ ok: false, error: String(err.message || err), payload });\n}\nconst d = (body && body.data) ? body.data : body;\nconst uid = d && (d.uid || d.bookingUid || d.id);\ntry {\n  if (storeClient && uid) {\n    storeClient.bookingUid = String(uid);\n    storeClient.lastBookingUid = String(uid);\n    storeClient.calBookingLink = 'https://cal.com/booking/' + uid;\n    storeClient.lien_reservation = storeClient.calBookingLink;\n    storeClient.scheduled_at = (d && d.start) || start;\n    storeClient.bookingCreated = true;\n    storeClient.prenom = storeClient.prenom || name;\n    storeClient.clientEmail = storeClient.clientEmail || email;\n    if (prestKey) storeClient.prestation = prestKey;\n    if (packKey) { storeClient.packName = packKey; storeClient.pack = packKey; storeClient.lastPackName = packKey; }\n    storeClient.calBookingNotes = calNotes;\n  }\n} catch (eUp) {}\nreturn JSON.stringify({\n  ok: true,\n  bookingUid: uid,\n  start: d && (d.start || start),\n  status: d && d.status,\n  eventTypeSlug: slug,\n  name, email,\n  lien: uid ? ('https://cal.com/booking/' + uid) : '',\n  calNotes,\n  orderTotalDh: basePrice,\n  raw: d,\n});\n"
+      },
+      "id": "383e4bb2-0dd4-44ed-9c10-dce2cda14507",
+      "name": "Create_booking",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4320,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Reschedule an existing booking to a new start from free slots. Speak to the client in French natural time only.",
+        "jsCode": "function parseArgs(q) {\n  if (q && typeof q === 'object' && !Array.isArray(q)) return q;\n  const s = String(q || '').trim();\n  if (!s) return {};\n  try { return JSON.parse(s); } catch (e) {}\n  const out = {};\n  const iso = s.match(/\\d{4}-\\d{2}-\\d{2}T[\\d:.+-Z]+/g) || [];\n  const days = s.match(/\\d{4}-\\d{2}-\\d{2}/g) || [];\n  if (iso[0]) out.start = iso[0];\n  if (days[0]) out.startDay = days[0];\n  if (days[1]) out.endDay = days[1];\n  const em = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  if (em) out.email = em[0];\n  const uid = s.match(/bookingUid[\"'\\s:=]+([A-Za-z0-9_-]+)/i) || s.match(/\\buid[\"'\\s:=]+([A-Za-z0-9_-]+)/i);\n  if (uid) out.bookingUid = uid[1];\n  return out;\n}\nfunction ymd(d) {\n  const y = d.getFullYear();\n  const m = String(d.getMonth() + 1).padStart(2, '0');\n  const day = String(d.getDate()).padStart(2, '0');\n  return `${y}-${m}-${day}`;\n}\nfunction mapSlug(raw) {\n  // BUYER SETUP: pass one of the Cal.com slugs configured in Normalize & Filter.\n  return String(raw || 'YOUR_DEFAULT_EVENT_TYPE').toLowerCase().trim().replace(/_/g, '-');\n}\nconst http = helpers.httpRequest.bind(helpers);\nconst HDR_SLOTS = {\n  'cal-api-version': '2024-09-04',\n  Accept: 'application/json',\n  'User-Agent': 'your-businessBot-AgentV8/1.0',\n};\nconst HDR_BOOK = {\n  'Content-Type': 'application/json',\n  Accept: 'application/json',\n  'cal-api-version': '2024-08-13',\n  'User-Agent': 'Mozilla/5.0 (compatible; your-businessBot/1.0; +https://cal.com)',\n  Origin: 'https://cal.com',\n  Referer: 'https://cal.com/',\n};\n\nconst args = parseArgs(query);\nconst bookingUid = String(args.bookingUid || args.uid || '').trim();\nconst start = String(args.start || args.slot || '').trim();\nconst email = String(args.email || args.rescheduledBy || '').trim();\nif (!bookingUid || !start) {\n  return JSON.stringify({ ok: false, need: ['bookingUid','start'], got: { bookingUid, start } });\n}\nconst url = `https://api.cal.com/v2/bookings/${encodeURIComponent(bookingUid)}/reschedule`;\nconst bodyPayload = { start };\nif (email) bodyPayload.rescheduledBy = email;\ntry {\n  const store = $getWorkflowStaticData('global');\n  const owners = (store && store.bookingOwners) || {};\n  const meta = owners[bookingUid];\n  let prep = {};\n  try { prep = $('Prep Agent Input').first().json || {}; } catch (e0) {}\n  const sid = String(prep.igUserId || prep.senderId || prep.sessionId || '').trim();\n  if (meta && meta.senderId && sid && String(meta.senderId) !== sid) {\n    return JSON.stringify({ ok: false, error: 'foreign_booking', hint: 'Reservation d un autre client — refuser Update.' });\n  }\n} catch (eOwn) {}\nlet body;\ntry {\n  body = await http({ method: 'POST', url, headers: HDR_BOOK, body: bodyPayload, json: true });\n} catch (err) {\n  return JSON.stringify({ ok: false, error: String(err.message || err), bookingUid, start });\n}\nconst d = (body && body.data) ? body.data : body;\nconst newUid = (d && (d.uid || d.bookingUid || d.id)) || bookingUid;\nconst startRaw = (d && d.start) || start;\ntry {\n  const store = $getWorkflowStaticData('global');\n  const clients = (store && store.clients) || {};\n  for (const v of Object.values(clients)) {\n    if (!v) continue;\n    const old = String(v.bookingUid || v.lastBookingUid || '');\n    if (old && (old === bookingUid || old === newUid || (email && String(v.clientEmail || '').toLowerCase() === email.toLowerCase()))) {\n      v.bookingUid = String(newUid);\n      v.lastBookingUid = String(newUid);\n      v.scheduled_at = startRaw;\n      v.calBookingLink = 'https://cal.com/booking/' + newUid;\n      v.lien_reservation = v.calBookingLink;\n      v.reporte = true;\n      v.bookingUpdated = true;\n      break;\n    }\n  }\n} catch (eUp) {}\nreturn JSON.stringify({\n  ok: true,\n  bookingUid: newUid,\n  previousUid: bookingUid,\n  start: startRaw,\n  rescheduled: true,\n  raw: d,\n});\n"
+      },
+      "id": "4bd14f88-3d8e-4754-ae6f-4714a8bf8c81",
+      "name": "Update_booking",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4448,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Cancel Cal.com booking. Pass JSON: {\"bookingUid\":\"...\"}.",
+        "jsCode": "function parseArgs(q) {\n  if (q && typeof q === 'object' && !Array.isArray(q)) return q;\n  const s = String(q || '').trim();\n  if (!s) return {};\n  try { return JSON.parse(s); } catch (e) {}\n  const out = {};\n  const iso = s.match(/\\d{4}-\\d{2}-\\d{2}T[\\d:.+-Z]+/g) || [];\n  const days = s.match(/\\d{4}-\\d{2}-\\d{2}/g) || [];\n  if (iso[0]) out.start = iso[0];\n  if (days[0]) out.startDay = days[0];\n  if (days[1]) out.endDay = days[1];\n  const em = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  if (em) out.email = em[0];\n  const uid = s.match(/bookingUid[\"'\\s:=]+([A-Za-z0-9_-]+)/i) || s.match(/\\buid[\"'\\s:=]+([A-Za-z0-9_-]+)/i);\n  if (uid) out.bookingUid = uid[1];\n  return out;\n}\nfunction ymd(d) {\n  const y = d.getFullYear();\n  const m = String(d.getMonth() + 1).padStart(2, '0');\n  const day = String(d.getDate()).padStart(2, '0');\n  return `${y}-${m}-${day}`;\n}\nfunction mapSlug(raw) {\n  // BUYER SETUP: pass one of the Cal.com slugs configured in Normalize & Filter.\n  return String(raw || 'YOUR_DEFAULT_EVENT_TYPE').toLowerCase().trim().replace(/_/g, '-');\n}\nconst http = helpers.httpRequest.bind(helpers);\nconst HDR_SLOTS = {\n  'cal-api-version': '2024-09-04',\n  Accept: 'application/json',\n  'User-Agent': 'your-businessBot-AgentV8/1.0',\n};\nconst HDR_BOOK = {\n  'Content-Type': 'application/json',\n  Accept: 'application/json',\n  'cal-api-version': '2024-08-13',\n  'User-Agent': 'Mozilla/5.0 (compatible; your-businessBot/1.0; +https://cal.com)',\n  Origin: 'https://cal.com',\n  Referer: 'https://cal.com/',\n};\n\nconst args = parseArgs(query);\nconst bookingUid = String(args.bookingUid || args.uid || '').trim();\nif (!bookingUid) {\n  return JSON.stringify({ ok: false, need: ['bookingUid'] });\n}\n// Ownership: only cancel bookings registered to a known client in this workflow memory\ntry {\n  const store = $getWorkflowStaticData('global');\n  const owners = (store && store.bookingOwners) || {};\n  const meta = owners[bookingUid];\n  let prep = {};\n  try { prep = $('Prep Agent Input').first().json || {}; } catch (e0) {}\n  const sid = String(prep.igUserId || prep.senderId || prep.sessionId || '').trim();\n  if (meta && meta.senderId && sid && String(meta.senderId) !== sid) {\n    return JSON.stringify({\n      ok: false,\n      error: 'foreign_booking',\n      hint: 'Cette reservation n appartient pas a cette conversation. Refuser.',\n    });\n  }\n  // If registry unknown but Prep says no own booking — refuse blind cancel of arbitrary uid\n  const own = String(prep.appointment_id || prep.bookingUid || '').trim();\n  if (!meta && own && own !== bookingUid) {\n    return JSON.stringify({ ok: false, error: 'foreign_booking', hint: 'UID different de la resa de cette conversation.' });\n  }\n} catch (eOwn) {}\nconst url = `https://api.cal.com/v2/bookings/${encodeURIComponent(bookingUid)}/cancel`;\nlet body;\ntry {\n  body = await http({\n    method: 'POST',\n    url,\n    headers: HDR_BOOK,\n    body: { cancellationReason: 'Cancelled via YOUR_BUSINESS_NAME assistant' },\n    json: true,\n  });\n} catch (err) {\n  return JSON.stringify({ ok: false, error: String(err.message || err), bookingUid });\n}\nconst d = (body && body.data) ? body.data : body;\ntry {\n  const store = $getWorkflowStaticData('global');\n  if (store && store.bookingOwners) delete store.bookingOwners[bookingUid];\n} catch (eDel) {}\nreturn JSON.stringify({ ok: true, cancelled: true, bookingUid, raw: d });\n"
+      },
+      "id": "4fdf7533-79ae-49d6-9a71-27a82dfd7c1d",
+      "name": "Delete_booking",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4576,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Escalate to human team (Telegram/Airtable path after reply).",
+        "jsCode": "const reason = String(query || 'client request').slice(0, 500);\nreturn JSON.stringify({\n  ok: true,\n  escalated: true,\n  reason,\n  clientMessage: 'Merci — je transmets à l’équipe YOUR_BUSINESS_NAME, quelqu’un vous recontacte très bientôt 🤍'\n});"
+      },
+      "id": "99314076-df6e-41fe-9d50-ea082648db66",
+      "name": "Escalate",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4704,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generic final-response formatter. Customize the tone and escalation keywords for your business.\nconst mem = $('Prep Agent Input').first().json || {};\nconst agent = $input.first().json || {};\nlet out = String(agent.output || agent.text || agent.finalResponse || '').trim();\n\n// Do not expose internal tool calls or JSON to the client.\nout = out.replace(/<function\\s*=[\\s\\S]*?(<\\/function>|$)/gi, '')\n  .replace(/<tool_call[\\s\\S]*?(<\\/tool_call>|$)/gi, '')\n  .replace(/```(?:json)?[\\s\\S]*?```/gi, '')\n  .trim();\nif (!out) out = 'Thanks for your message. A member of our team will get back to you shortly.';\n\nconst message = String(mem.messageText || '').toLowerCase();\nconst escalationPattern = /complaint|manager|human|agent|refund|angry|bad service|plainte|réclamation|responsable|humain|conseiller|mécontent|mauvais service/i;\nconst escalated = escalationPattern.test(message) || /we.*(?:team|manager)|transferr|recontact/i.test(out);\nconst store = $getWorkflowStaticData('global');\nif (!store.clients) store.clients = {};\nconst key = mem.igUserId || mem.senderId || mem.sessionId;\nconst previous = store.clients[key] || {};\nif (key) {\n  store.clients[key] = {\n    ...previous,\n    prenom: mem.prenom || previous.prenom || '',\n    langue: mem.langue || previous.langue || 'EN',\n    prestation: mem.prestation || previous.prestation || '',\n    packName: mem.packName || mem.pack || previous.packName || '',\n    clientEmail: mem.clientEmail || previous.clientEmail || '',\n    updatedAt: new Date().toISOString(),\n  };\n}\nreturn [{ json: {\n  ...mem,\n  finalResponse: out,\n  output: out,\n  escalated,\n  escalade_requise: escalated,\n  intention: escalated ? 'escalation' : (mem.intention || 'general_question'),\n  status: escalated ? 'ESCALATED' : 'ACTIVE',\n  channel: mem.channel || 'test',\n  sessionId: mem.sessionId || mem.igUserId || mem.senderId || '',\n} }];\n"
+      },
+      "id": "75f7beec-2faf-4c24-b7f6-bf281ff5f62d",
+      "name": "Format Agent Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5040,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Save client facts for Airtable (parent prenom, enfants, pack, prestation, email, notes, theme). Call whenever you understand a fact — even with typos. Pass JSON: {\"sessionId\":\"from [SESSION]\",\"prenom\":\"Imane\",\"email\":\"…\",\"enfants\":[\"Max\"],\"prestation\":\"sitter\",\"pack\":\"vip\",\"notes\":\"inclure la mère\"}.",
+        "jsCode": "function parseArgs(q) {\n  if (q && typeof q === 'object' && !Array.isArray(q)) return q;\n  const s = String(q || '').trim();\n  if (!s) return {};\n  try { return JSON.parse(s); } catch (e1) {}\n  try {\n    const m = s.match(/\\{[\\s\\S]*\\}/);\n    if (m) return JSON.parse(m[0]);\n  } catch (e2) {}\n  const out = {};\n  for (const part of s.split(/[,&\\n]+/)) {\n    const kv = part.match(/^\\s*([A-Za-z0-9_]+)\\s*[:=]\\s*(.+?)\\s*$/);\n    if (kv) out[kv[1]] = kv[2].replace(/^[\"']|[\"']$/g, '');\n  }\n  return out;\n}\nfunction cap(n) {\n  const t = String(n || '').trim();\n  if (!t) return '';\n  return t.charAt(0).toUpperCase() + t.slice(1);\n}\nfunction blocked(n) {\n  return /^(oui|non|ok|vip|diamond|prestige|basic|mini|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|couple|famille|newborn|sitter|votre|vos|vous|de|du|des|la|le|les|mon|ma|mes|fils|fille|enfant|mere|m[eè]re|maman|papa|il|elle|comment|quoi|pourquoi|combien|quand|o[uù]|comment|svp|merci|bonjour|salut|hello|hey|aide|help|dis|donne|peux|veux|réserve|reserve|annule|reporte)$/i.test(String(n || '').trim());\n}\nfunction isJunkKidName(n) {\n  const t = String(n || '').trim();\n  if (!t || t.length < 2) return true;\n  if (/^(.)\\1+$/i.test(t)) return true; // ww, xx, aaa\n  if (t.length <= 3 && !/[aeiouyàâäéèêëïîôùûüœ]/i.test(t) && !/[\\u0600-\\u06FF]/.test(t)) return true;\n  return false;\n}\nfunction cleanName(n) {\n  const t = String(n || '').replace(/[^A-Za-zÀ-ÿ\\u0600-\\u06FF'’\\- ]/g, '').trim();\n  if (!t || t.length > 40 || blocked(t) || isJunkKidName(t)) return '';\n  if (t.split(/\\s+/).length > 3) return '';\n  return cap(t.split(/\\s+/)[0]);\n}\nfunction mapPack(p) {\n  const x = String(p || '').toLowerCase().trim();\n  if (/diamond/.test(x)) return 'diamond';\n  if (/\\bvip\\b|vip+/.test(x)) return 'vip';\n  if (/prestige/.test(x)) return 'prestige';\n  if (/basic|basique/.test(x)) return 'basic';\n  if (/\\bmini\\b/.test(x)) return 'mini';\n  return '';\n}\nfunction mapPrest(p) {\n  const x = String(p || '').toLowerCase().trim();\n  if (/sitter/.test(x)) return 'sitter';\n  if (/newborn|nouveau/.test(x)) return 'newborn';\n  if (/cake|smash/.test(x)) return 'cake_smash';\n  if (/birthday|anniv/.test(x)) return 'birthday';\n  if (/famil/.test(x)) return 'famille';\n  if (/couple/.test(x)) return 'couple';\n  if (/solo|portrait/.test(x)) return 'solo';\n  if (/gross|materni|enceinte/.test(x)) return 'grossesse';\n  if (/first.?year|premiere/.test(x)) return 'first_year';\n  return '';\n}\n\nconst args = parseArgs(query);\nconst store = $getWorkflowStaticData('global');\nif (!store.clients) store.clients = {};\n\nlet key = String(args.sessionId || args.senderId || args.session || '').trim();\nif (!key) {\n  try {\n    const prep = $('Prep Agent Input').first().json || {};\n    key = String(prep.igUserId || prep.senderId || prep.sessionId || '').trim();\n  } catch (e0) {}\n}\nif (!key) {\n  return JSON.stringify({ ok: false, error: 'missing_sessionId', hint: 'Pass sessionId from [SESSION]' });\n}\n\nconst c = store.clients[key] || {};\nconst parent = cleanName(args.prenom || args.parentPrenom || args.clientName || args.name || '');\nconst email = String(args.email || args.clientEmail || '').trim();\nconst pack = mapPack(args.pack || args.packName || '');\nconst prestation = mapPrest(args.prestation || args.session || '');\nconst theme = String(args.theme || args.decor || '').trim().slice(0, 80);\nconst notesIn = String(args.notes || args.bookingNotes || args.remarques || '').trim().slice(0, 1500);\n\nfunction toIsoDobSave(raw) {\n  const s = String(raw || '').trim();\n  if (!s) return '';\n  if (/^\\d{4}-\\d{2}-\\d{2}/.test(s)) return s.slice(0, 10);\n  const m = s.match(/^(\\d{1,2})[\\/.\\-](\\d{1,2})[\\/.\\-](\\d{2,4})$/);\n  if (!m) return '';\n  let d = parseInt(m[1], 10), mo = parseInt(m[2], 10), y = parseInt(m[3], 10);\n  if (y < 100) y += 2000;\n  if (y < 1990 || y > 2035 || mo < 1 || mo > 12 || d < 1 || d > 31) return '';\n  return y + '-' + String(mo).padStart(2, '0') + '-' + String(d).padStart(2, '0');\n}\nlet kids = [];\nlet kidsDobByName = {};\nconst kidsKeyPresent = ('enfants' in args) || ('children' in args) || ('enfant_prenoms' in args)\n  || ('enfant' in args) || ('childName' in args) || ('enfantPrenom' in args);\nconst rawKids = args.enfants || args.children || args.enfant_prenoms || args.enfant || args.childName || args.enfantPrenom || [];\nif (Array.isArray(rawKids)) {\n  for (const k of rawKids) {\n    if (typeof k === 'object' && k) {\n      const n = cleanName(k.prenom || k.name);\n      if (n && (!parent || n.toLowerCase() !== parent.toLowerCase())) {\n        kids.push(n);\n        const d = toIsoDobSave(k.date_naissance || k.dob || '');\n        if (d) kidsDobByName[n.toLowerCase()] = d;\n      }\n    } else {\n      const n = cleanName(k);\n      if (n && (!parent || n.toLowerCase() !== parent.toLowerCase())) kids.push(n);\n    }\n  }\n} else if (rawKids) {\n  for (const part of String(rawKids).split(/\\s*(?:,|;|\\/|\\bet\\b|\\band\\b|\\+)\\s*/i)) {\n    const n = cleanName(part);\n    if (n && (!parent || n.toLowerCase() !== parent.toLowerCase())) kids.push(n);\n  }\n}\n// dedupe\nkids = [...new Set(kids.map((x) => x.toLowerCase()))].map(cap);\n\n// Explicit removals: remove_enfants / removeEnfant\nconst rawRemove = args.remove_enfants || args.removeEnfants || args.remove_enfant || [];\nconst removeNames = [];\nconst remList = Array.isArray(rawRemove) ? rawRemove : String(rawRemove || '').split(/[,;]/);\nfor (const r of remList) {\n  const n = cleanName(typeof r === 'string' ? r : (r && r.prenom));\n  // cleanName may reject junk — still allow removing junk already stored\n  const raw = String(typeof r === 'string' ? r : (r && (r.prenom || r.name)) || '').replace(/[^A-Za-zÀ-ÿ\\u0600-\\u06FF'’\\- ]/g, '').trim();\n  const name = n || (raw ? cap(raw.split(/\\s+/)[0]) : '');\n  if (name) removeNames.push(name.toLowerCase());\n}\n\nif (parent) c.prenom = parent;\nif (email && email.includes('@')) c.clientEmail = email;\nif (pack) { c.packName = pack; c.pack = pack; c.lastPackName = pack; }\nif (prestation) { c.prestation = prestation; c.lastPrestation = prestation; }\nif (theme) c.theme = theme;\nif (notesIn) {\n  c.bookingNotes = c.bookingNotes ? (c.bookingNotes + ' · ' + notesIn) : notesIn;\n  c.notes = c.bookingNotes;\n  if (prestation || c.prestation) c.enfant_remarques = c.bookingNotes;\n}\n\nconst prevKids = Array.isArray(c.enfants) ? c.enfants : [];\nif (kidsKeyPresent) {\n  // REPLACE full list (correction-safe). Keep DOB when same prenom survives.\n  const prevBy = {};\n  for (const e of prevKids) {\n    if (e && e.prenom) prevBy[String(e.prenom).toLowerCase()] = e;\n  }\n  c.enfants = kids.map((n) => {\n    const prev = prevBy[n.toLowerCase()];\n    return {\n      prenom: n,\n      date_naissance: kidsDobByName[n.toLowerCase()] || (prev && prev.date_naissance) || '',\n    };\n  });\n  c.enfantPrenoms = c.enfants.map((e) => e.prenom);\n  c.enfantDobs = c.enfants.map((e) => e.date_naissance || '');\n  c._enfantsReplacedAt = new Date().toISOString();\n} else if (removeNames.length) {\n  c.enfants = prevKids.filter((e) => e && e.prenom && !removeNames.includes(String(e.prenom).toLowerCase()));\n  c.enfantPrenoms = c.enfants.map((e) => e.prenom);\n  c.enfantDobs = c.enfants.map((e) => e.date_naissance || '');\n} else if (kids.length) {\n  // Backward-compatible merge only when enfants key absent but names passed oddly\n  const by = {};\n  for (const e of prevKids) {\n    if (e && e.prenom) by[String(e.prenom).toLowerCase()] = e;\n  }\n  for (const n of kids) {\n    const k = n.toLowerCase();\n    if (!by[k]) by[k] = { prenom: n, date_naissance: '' };\n  }\n  c.enfants = Object.values(by);\n  c.enfantPrenoms = c.enfants.map((e) => e.prenom);\n}\nconst dob = toIsoDobSave(args.date_naissance || args.dob || '');\nif (dob && c.enfants && c.enfants.length === 1) {\n  c.enfants[0].date_naissance = dob;\n  c.enfantDobs = [dob];\n}\nc.updatedAt = new Date().toISOString();\nc._crmDirty = true;\nc.enfantsCorrected = !!(kidsKeyPresent || removeNames.length || dob);\nstore.clients[key] = c;\ntry {\n  const prep = $('Prep Agent Input').first().json || {};\n  const ig = String(prep.igUserId || '').trim();\n  const user = String(prep.instagramUsername || '').replace(/^@/, '').trim();\n  if (ig && ig !== key) {\n    store.clients[ig] = Object.assign({}, store.clients[ig] || {}, c, { igUserId: ig });\n  }\n  if (user && user !== key && !/^\\d{5,}$/.test(user)) {\n    c.instagramUsername = user;\n    store.clients[user] = Object.assign({}, store.clients[user] || {}, c, { instagramUsername: user });\n    store.clients[key] = c;\n  }\n} catch (eAlias) {}\n\nreturn JSON.stringify({\n  ok: true,\n  sessionId: key,\n  airtable: 'queued_for_sync',\n  saved: {\n    prenom: c.prenom || '',\n    email: c.clientEmail || '',\n    enfants: c.enfantPrenoms || [],\n    prestation: c.prestation || '',\n    pack: c.packName || '',\n    notes: c.bookingNotes || '',\n    theme: c.theme || '',\n  },\n});\n"
+      },
+      "id": "ebdcc40c-c872-48b6-8975-ef5efdccf764",
+      "name": "Save_CRM",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.2,
+      "position": [
+        4832,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## START HERE — Template setup\n\nThis is a generic, inactive template. Replace every `YOUR_...` placeholder before activating. Open the **Setup Guide** delivered with this JSON.\n\nYour original workflow was not modified.",
+        "height": 260,
+        "width": 480,
+        "color": 5
+      },
+      "id": "setup-note-start",
+      "name": "SETUP — Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1320,
+        -740
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Credentials to create in n8n\n\n1. Meta Instagram Page Token\n2. Meta WhatsApp Cloud Token\n3. Airtable PAT\n4. Anthropic API key\n5. Groq API key\n6. Cal.com API key\n7. Telegram Bot Token (optional)\n\nAttach the named HTTP Header Auth credentials to the matching nodes. Code nodes contain `YOUR_...` placeholders for their direct API calls.",
+        "height": 330,
+        "width": 520,
+        "color": 4
+      },
+      "id": "setup-note-credentials",
+      "name": "SETUP — Credentials Required",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        -740
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/*\nBUYER SETUP — READ BEFORE ACTIVATING\n\n1. In n8n > Credentials, create these credentials:\n   - Meta Instagram Page Token (Header Auth: Authorization = Bearer YOUR_META_ACCESS_TOKEN)\n   - Meta WhatsApp Cloud Token (Header Auth: Authorization = Bearer YOUR_META_ACCESS_TOKEN)\n   - Airtable Personal Access Token (Header Auth: Authorization = Bearer YOUR_AIRTABLE_PERSONAL_ACCESS_TOKEN)\n   - Anthropic API Key (Header Auth: x-api-key = YOUR_ANTHROPIC_API_KEY)\n   - Groq API Key (Header Auth: Authorization = Bearer YOUR_GROQ_API_KEY)\n   - Cal.com API Key (used in Cal.com code tools; replace YOUR_CALCOM_API_KEY)\n   - Telegram Bot Token (optional; replace YOUR_TELEGRAM_BOT_TOKEN)\n\n2. Replace every YOUR_... placeholder in the workflow.\n3. Update these nodes with your business data:\n   - Get_catalogue: services, packages, prices and inclusions\n   - Normalize & Filter: Cal.com event-type map and booking durations\n   - Prep Agent Input: business description, location, language and tone\n   - Format Agent Reply: escalation rules and fallback copy\n4. Create Airtable tables using the setup guide and replace base/table IDs.\n5. Configure Meta with the production webhook URLs after activating the workflow.\n\nThis disabled node exists only as in-editor documentation. Do not connect or enable it.\n*/\nreturn [];\n"
+      },
+      "id": "setup-config-code",
+      "name": "SETUP — Business Configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -230,
+        -690
+      ],
+      "disabled": true
+    }
+  ],
+  "connections": {
+    "Find Follow-Up Candidates": {
+      "main": [
+        [
+          {
+            "node": "Build Follow-Up Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Follow-Up Prompt": {
+      "main": [
+        [
+          {
+            "node": "Generate Follow-Up Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Follow-Up Claude": {
+      "main": [
+        [
+          {
+            "node": "Parse Follow-Up Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Follow-Up Text": {
+      "main": [
+        [
+          {
+            "node": "Is Instagram?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Instagram?": {
+      "main": [
+        [
+          {
+            "node": "Follow-Up IG DM",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Follow-Up WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Follow-Up IG DM": {
+      "main": [
+        [
+          {
+            "node": "Check Follow-Up Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Follow-Up WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Check Follow-Up Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Instagram Webhook": {
+      "main": [
+        [
+          {
+            "node": "Is Meta Verification?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Meta OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Meta Verification?": {
+      "main": [
+        [
+          {
+            "node": "Respond Meta Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Meta OK": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "WA Is Meta Verification?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WA Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WA Is Meta Verification?": {
+      "main": [
+        [
+          {
+            "node": "WA Respond Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WA Respond OK": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Filter": {
+      "main": [
+        [
+          {
+            "node": "Is Instagram Channel?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Spam?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Is Audio?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Audio?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Audio Meta",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcription OK?": {
+      "main": [
+        [
+          {
+            "node": "Merge Text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audio Fallback Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audio Fallback Message": {
+      "main": [
+        [
+          {
+            "node": "Channel Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Text": {
+      "main": [
+        [
+          {
+            "node": "Load Client Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Client Memory": {
+      "main": [
+        [
+          {
+            "node": "Prep Agent Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Escalation?": {
+      "main": [
+        [
+          {
+            "node": "Log Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Channel Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Escalation": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (optional)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Channel Router",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Airtable Log Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Channel Router": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Instagram DM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Message": {
+      "main": [
+        [
+          {
+            "node": "Log & Update CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log & Update CRM": {
+      "main": [
+        [
+          {
+            "node": "Airtable Upsert Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Instagram Channel?": {
+      "main": [
+        [
+          {
+            "node": "Fetch IG Username",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Spam?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch IG Username": {
+      "main": [
+        [
+          {
+            "node": "Apply IG Username",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply IG Username": {
+      "main": [
+        [
+          {
+            "node": "Is Spam?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audio": {
+      "main": [
+        [
+          {
+            "node": "Transcription OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Audio Meta": {
+      "main": [
+        [
+          {
+            "node": "Resolve Media URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Media URL?": {
+      "main": [
+        [
+          {
+            "node": "Download Audio File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audio Fallback Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Audio File": {
+      "main": [
+        [
+          {
+            "node": "Whisper Groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Whisper Groq": {
+      "main": [
+        [
+          {
+            "node": "Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Media URL": {
+      "main": [
+        [
+          {
+            "node": "Has Media URL?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Follow-Up Send": {
+      "main": [
+        [
+          {
+            "node": "Update Follow-Up Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Airtable Upsert Lead": {
+      "main": [
+        [
+          {
+            "node": "CRM Sync Relational",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Agent Input": {
+      "main": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Agent Reply": {
+      "main": [
+        [
+          {
+            "node": "Needs Escalation?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get_catalogue": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get_slots": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create_booking": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update_booking": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete_booking": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save_CRM": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Booking Assistant",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Booking Assistant": {
+      "main": [
+        [
+          {
+            "node": "Format Agent Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Instagram DM": {
+      "main": [
+        [
+          {
+            "node": "Log & Update CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Follow-Up Schedule": {
+      "main": [
+        [
+          {
+            "node": "Find Follow-Up Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
