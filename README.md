@@ -4,7 +4,7 @@ A customizable workflow for Instagram and WhatsApp enquiries, audio transcriptio
 
 ![Full n8n workflow canvas](workflow-overview.jpg)
 
-Actual n8n editor screenshots supplied by the workflow author. These illustrate the workflow architecture; they do not verify the sanitized template's configuration or execution.
+The overview shows the overall layout. Use the close-ups below to read node names; open each image at full size for the clearest view. These screenshots illustrate the author's workflow architecture and do not verify the sanitized template's configuration or execution.
 
 ## Workflow screenshots
 
@@ -14,11 +14,15 @@ Webhook entry points, Meta verification and message normalization.
 
 ![Meta webhook entry points](workflow-webhooks.jpg)
 
+[Open webhook screenshot at full size](workflow-webhooks.jpg?raw=true)
+
 ### Audio transcription
 
 Audio download, Groq transcription and fallback handling.
 
 ![Audio processing branch](workflow-audio.jpg)
+
+[Open audio screenshot at full size](workflow-audio.jpg?raw=true)
 
 ### AI assistant and tools
 
@@ -26,11 +30,15 @@ The assistant connects to its chat model, memory, catalogue, appointment tools, 
 
 ![AI assistant and connected tools](workflow-agent-tools.jpg)
 
+[Open assistant screenshot at full size](workflow-agent-tools.jpg?raw=true)
+
 ### Replies, CRM and escalation
 
 Channel routing, Airtable lead updates, relational CRM synchronization and optional Telegram notifications.
 
 ![Reply routing and CRM escalation branches](workflow-crm-escalation.jpg)
+
+[Open CRM screenshot at full size](workflow-crm-escalation.jpg?raw=true)
 
 Download [workflow.json](workflow.json) and read [BUYER_SETUP.md](BUYER_SETUP.md), alongside the corrections in [REVIEW.md](REVIEW.md).
 
