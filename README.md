@@ -2,9 +2,35 @@
 
 A customizable workflow for Instagram and WhatsApp enquiries, audio transcription, appointment tools, Airtable lead tracking, human handoff and scheduled follow-ups.
 
-![Workflow overview and buyer configuration preview](workflow-preview.jpg)
+![Full n8n workflow canvas](workflow-overview.jpg)
 
-This screenshot shows a documentation preview generated from the workflow's node names. It is not the n8n editor; the local n8n server was unavailable during preparation.
+Actual n8n editor screenshots supplied by the workflow author. These illustrate the workflow architecture; they do not verify the sanitized template's configuration or execution.
+
+## Workflow screenshots
+
+### Instagram and WhatsApp webhooks
+
+Webhook entry points, Meta verification and message normalization.
+
+![Meta webhook entry points](workflow-webhooks.jpg)
+
+### Audio transcription
+
+Audio download, Groq transcription and fallback handling.
+
+![Audio processing branch](workflow-audio.jpg)
+
+### AI assistant and tools
+
+The assistant connects to its chat model, memory, catalogue, appointment tools, escalation and CRM tools.
+
+![AI assistant and connected tools](workflow-agent-tools.jpg)
+
+### Replies, CRM and escalation
+
+Channel routing, Airtable lead updates, relational CRM synchronization and optional Telegram notifications.
+
+![Reply routing and CRM escalation branches](workflow-crm-escalation.jpg)
 
 Download [workflow.json](workflow.json) and read [BUYER_SETUP.md](BUYER_SETUP.md), alongside the corrections in [REVIEW.md](REVIEW.md).
 

@@ -21,4 +21,4 @@ Reviewed the previously generated generic export. The original working workflow 
 
 ## Publication status
 
-The repository is intended as a private draft for the owner. Its preview screenshot shows a generated documentation overview, explicitly labelled as such. The local n8n server was unavailable, so no actual n8n editor screenshot or live execution verification is included. Resolve the functional findings above before listing this template as a finished product.
+The repository is intended as a private draft for the owner. The README includes five actual n8n editor screenshots supplied by the workflow author. The sanitized JSON imported successfully into an isolated n8n instance; live execution has not been verified. Resolve the functional findings above before listing this template as a finished product.
